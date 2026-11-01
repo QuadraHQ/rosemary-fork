@@ -112,3 +112,22 @@ fn emulated_backend_refuses_host_libraries() {
         "native: 0\nno libc: host libraries can only be called from the native backend\n"
     );
 }
+
+#[test]
+fn no_passthrough_refuses_host_libraries() {
+    if !native_host() {
+        return;
+    }
+    let Some(program) = common::build_x86_64("hostbridge_probe", BRIDGE, &[]) else {
+        return;
+    };
+    let out = common::driver_command()
+        .args(["run", "--native", &program])
+        .env("ROSEMARY_NO_PASSTHROUGH", "1")
+        .output()
+        .expect("running the driver");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "native: 0\nno libc: refused by ROSEMARY_NO_PASSTHROUGH\n"
+    );
+}

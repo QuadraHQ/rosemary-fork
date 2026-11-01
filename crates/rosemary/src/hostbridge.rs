@@ -44,10 +44,18 @@ fn callable() -> bool {
     )
 }
 
+/// Why a host library cannot be opened, if it cannot.
+fn refusal() -> Option<String> {
+    if darwin::strict::enabled() {
+        return Some(format!("refused by {}", darwin::strict::VAR));
+    }
+    (!callable()).then(|| "host libraries can only be called from the native backend".into())
+}
+
 /// `int quadra_host_native(void)`: 1 when a pointer from [`dlsym`] can be called
-/// as a plain C function, 0 under the emulated backend.
+/// as a plain C function, 0 under the emulated backend or `ROSEMARY_NO_PASSTHROUGH`.
 pub extern "C" fn native() -> c_int {
-    c_int::from(callable())
+    c_int::from(refusal().is_none())
 }
 
 /// `void *quadra_host_dlopen(const char *path, int mode)`
@@ -60,8 +68,8 @@ pub extern "C" fn native() -> c_int {
 ///
 /// `path` is null or NUL-terminated.
 pub unsafe extern "C" fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void {
-    if !callable() {
-        fail("host libraries can only be called from the native backend".into());
+    if let Some(reason) = refusal() {
+        fail(reason);
         return std::ptr::null_mut();
     }
     let mut flags = if mode & DARWIN_RTLD_NOW != 0 {
@@ -103,8 +111,8 @@ pub unsafe extern "C" fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void
 ///
 /// `name` is NUL-terminated; `handle` is null or from [`dlopen`].
 pub unsafe extern "C" fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void {
-    if !callable() {
-        fail("host libraries can only be called from the native backend".into());
+    if let Some(reason) = refusal() {
+        fail(reason);
         return std::ptr::null_mut();
     }
     let handle = if handle.is_null() {
