@@ -1,3 +1,9 @@
+> **Quadra's fork.** This is QuadraHQ's build of [microlift/rosemary](https://github.com/microlift/rosemary), kept on the
+> `quadra-vr` branch and released as `0.5.0-quadra.N`. It adds what Quadra needs to run Roblox's VR: forced library
+> insertion into hardened programs (`ROSEMARY_DYLD_INSERT_FORCE`), the `quadra_host_*` bridge to host libraries, and a global
+> `dlsym` that sees inserted libraries. See [docs/quadra-vr.md](docs/quadra-vr.md). Everything else is upstream's, GPL-3.0.
+> Quadra installs either this build or upstream's from its Rosemary settings.
+
 # Rosemary
 
 <a href="https://discord.gg/HUaPNwFwae">
