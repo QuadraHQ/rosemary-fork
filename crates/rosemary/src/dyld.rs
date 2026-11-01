@@ -1384,6 +1384,10 @@ pub fn inserted_libraries<S: machish::spec::MachSpec + 'static>(
     }
     match machish::image::MachObject::parse_any(bytes, spec) {
         Ok(obj) if obj.restricts_dyld_environment() => {
+            if insertion_forced() {
+                eprintln!("rosemary: inserting into a hardened or restricted image: forced");
+                return requested;
+            }
             eprintln!(
                 "rosemary: DYLD_INSERT_LIBRARIES ignored: the image is hardened or restricted"
             );
@@ -1391,6 +1395,13 @@ pub fn inserted_libraries<S: machish::spec::MachSpec + 'static>(
         }
         _ => requested,
     }
+}
+
+/// `ROSEMARY_DYLD_INSERT_FORCE=1` in the host's environment: insert into an
+/// image dyld would refuse to. Never read from the guest's environment, so a
+/// guest cannot lift its own restriction.
+fn insertion_forced() -> bool {
+    std::env::var("ROSEMARY_DYLD_INSERT_FORCE").is_ok_and(|v| v == "1")
 }
 
 /// A source that searches the guest's `DYLD_LIBRARY_PATH` before anything else
