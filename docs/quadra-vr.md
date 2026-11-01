@@ -1,8 +1,8 @@
 # VR for Roblox under Rosemary (Quadra)
 
 Quadra gives Roblox's macOS client an OpenXR headset by injecting a library into
-`RobloxPlayer` (`libQuadraVR.dylib`, built from Quadra's `vr_device.c` and
-`vr_xr.c`). Under Darling that library is part of `libQuadraShims.dylib`. This
+`RobloxPlayer` (`libQuadraVR.dylib`, built from Quadra's `vr/vr_device.c` and
+`vr/vr_xr.c`). Under Darling that library is part of `libQuadraShims.dylib`. This
 document is what Rosemary adds so the same sources run here, how to build and
 start it, and what has and has not been checked. It documents the `quadra-vr`
 branch of this fork; none of it is upstream.
@@ -106,14 +106,14 @@ cargo build --release --bin rosemary
 
 # The VR library, from a Quadra checkout. Cross-compiles Mach-O with clang+lld
 # against the Darwin SDK that Quadra's runtime uses (DARLING_SYSROOT overrides it).
-rosemary_vr/build_rosemary_vr.sh          # -> build/libQuadraVR.dylib
-QUADRA_VR_TRACE=1 rosemary_vr/build_rosemary_vr.sh   # -> libQuadraVR-trace.dylib (also logs getState)
+rosemary/vr/build_rosemary_vr.sh          # -> build/libQuadraVR.dylib
+QUADRA_VR_TRACE=1 rosemary/vr/build_rosemary_vr.sh   # -> libQuadraVR-trace.dylib (also logs getState)
 ```
 
-`rosemary_vr/rosemary_glue.c` is the only Rosemary-specific source. It defines
+`rosemary/vr/rosemary_glue.c` is the only Rosemary-specific source. It defines
 `_elfcalls`, a pointer to `{open, close, symbol}` of the shape Darling's loader
 publishes, with the three functions forwarding to `quadra_host_*`.
-`vr_device.c` and `vr_xr.c` are compiled unchanged.
+`vr/vr_device.c` and `vr/vr_xr.c` are compiled unchanged.
 
 ## Running
 
@@ -139,7 +139,7 @@ host's environment reaches the guest (see `usage.md`).
 
 ## Testing without a headset
 
-Quadra's `rosemary_vr/test_rosemary_vr.sh` does the whole thing: builds the
+Quadra's `rosemary/vr/test_rosemary_vr.sh` does the whole thing: builds the
 trace library, copies the installed Roblox app and makes a new prefix in a
 temporary directory (the live prefix and its sign-in are not touched), starts
 the Monado emulator (`~/.local/share/quadrahq/vr-emulator/run-service.sh`),
