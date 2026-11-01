@@ -579,6 +579,9 @@ pub(crate) struct HostProviders {
     /// `steamclient.dylib` leaves undefined. Empty when this install has no
     /// generated dylib. See [`crate::steam`].
     steam: machish::resolve::SyntheticDylib,
+    /// `quadra_host_*`, the host's own loader for injected guest code. See
+    /// [`crate::hostbridge`].
+    hostbridge: machish::resolve::SyntheticDylib,
     /// OpenGL, on the GL library SDL made the context against rather than on
     /// whichever one the host loader has. See [`crate::opengl`].
     opengl: machish::resolve::LazyDylib,
@@ -626,6 +629,7 @@ impl HostProviders {
             frameworks: crate::frameworks::provider(),
             dyld: crate::dyld::provider(),
             steam: crate::steam::provider(),
+            hostbridge: crate::hostbridge::provider(),
             openal: crate::openal::provider(),
             opengl: crate::opengl::provider(),
             eager: eager_binding_shims(),
@@ -646,6 +650,7 @@ impl HostProviders {
         providers.push(&self.frameworks);
         providers.push(&self.dyld);
         providers.push(&self.steam);
+        providers.push(&self.hostbridge);
         providers.push(&self.opengl);
         providers.push(&self.openal);
         providers.push(&self.eager);

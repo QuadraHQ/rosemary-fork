@@ -3222,6 +3222,11 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("pwrite", I64, I32, P, U64, I64),
     cbsig!([3], "qsort", V, P, U64, U64, P),
     cbsig!([4], "qsort_r", V, P, U64, U64, P, P),
+    // [`crate::hostbridge`]: the host loader, for guest code that drives a host library.
+    sig!("quadra_host_native", I32),
+    sig!("quadra_host_dlopen", P, P, I32),
+    sig!("quadra_host_dlsym", P, P, P),
+    sig!("quadra_host_dlerror", P),
     // `raise` and `kill` deliver to this process, so a guest handler installed
     // through [`crate::signal`] is reached exactly the way the kernel reaches
     // any other: asynchronously, on whichever thread the kernel picks.
