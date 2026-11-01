@@ -1,3 +1,5 @@
+# Quadra's fork (QuadraHQ/rosemary-fork): upstream's release workflow, unchanged. A v* tag whose version
+# matches Cargo.toml (for example v0.5.0-quadra.1) builds and publishes the AppImage and checksums.
 name: release
 
 on:
