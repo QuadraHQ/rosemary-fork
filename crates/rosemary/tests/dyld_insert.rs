@@ -90,3 +90,45 @@ fn guest_cannot_force_insertion_into_a_restricted_image() {
     let (_, out, _) = common::run_guest_env(&[("ROSEMARY_ENVIRON", &environ)], &main, &[]);
     assert_eq!(out, "main\n");
 }
+
+const EXPORTING: &str = r#"
+int quadra_inserted_answer(void) { return 42; }
+"#;
+
+const LOOKING: &str = r#"
+extern int puts(const char *);
+extern void *dlsym(void *, const char *);
+int main(void) {
+    int (*answer)(void) = dlsym((void *)-2 /* RTLD_DEFAULT */, "quadra_inserted_answer");
+    puts(answer && answer() == 42 ? "found" : "missing");
+    return 0;
+}
+"#;
+
+/// Native backend only: it is the one that records the program's dylibs for a
+/// later lookup.
+fn run_native(env: &[(&str, &str)], program: &str) -> String {
+    let mut command = common::driver_command();
+    command
+        .args(["run", "--native", program])
+        .envs(env.iter().copied());
+    String::from_utf8_lossy(&command.output().expect("running the driver").stdout).into_owned()
+}
+
+#[test]
+fn global_dlsym_finds_an_inserted_library_symbol() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+    let Some(lib) = common::build_x86_64("insert_exporting", EXPORTING, &["-dynamiclib"]) else {
+        return;
+    };
+    let Some(main) = common::build_x86_64("insert_looking", LOOKING, &[]) else {
+        return;
+    };
+    assert_eq!(
+        run_native(&[("ROSEMARY_DYLD_INSERT_LIBRARIES", &lib)], &main),
+        "found\n"
+    );
+    assert_eq!(run_native(&[], &main), "missing\n");
+}

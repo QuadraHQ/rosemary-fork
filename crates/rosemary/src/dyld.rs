@@ -1597,8 +1597,22 @@ fn lookup(handle: u64, name: &str) -> Option<u64> {
     // for `readdir` on Linux would otherwise get glibc's, whose `struct dirent`
     // is not the one the guest was compiled against; `darwin::symbol` refuses a
     // divergent name by the same list the loader binds against.
-    let addr = system_symbol(name)?;
-    Some(remember_native_symbol(addr, name, None))
+    if let Some(addr) = system_symbol(name) {
+        return Some(remember_native_symbol(addr, name, None));
+    }
+    // Last, so nothing a library of the program's own defines can displace what
+    // this runtime answers: a global search covers those libraries too, the
+    // ones inserted ahead of the program among them.
+    program_image_symbol(&mangled)
+}
+
+/// `mangled` (the Mach-O spelling) in the dylibs the executable was linked with.
+fn program_image_symbol(mangled: &str) -> Option<u64> {
+    let images = PROGRAM_IMAGES.get()?;
+    images
+        .iter()
+        .find_map(|image| image.resolve(images, mangled, 0))
+        .map(|resolved| resolved.addr)
 }
 
 /// What libSystem answers `name` with: the global search's host half, and the
