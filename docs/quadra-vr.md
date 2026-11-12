@@ -1,18 +1,22 @@
 # VR for Roblox under Rosemary (Quadra)
 
 Quadra gives Roblox's macOS client an OpenXR headset by injecting a library into
-`RobloxPlayer` (`libQuadraVR.dylib`, built from Quadra's `vr/vr_device.c` and
-`vr/vr_xr.c`). Under Darling that library is part of `libQuadraShims.dylib`. This
-document is what Rosemary adds so the same sources run here, how to build and
-start it, and what has and has not been checked. It documents the `quadra-vr`
-branch of this fork; none of it is upstream.
+`RobloxPlayer` (`libQuadraVR.dylib`, built from Quadra's `vr/vr_device.c`,
+`vr/vr_xr.c` and `vr/rosemary_glue.c`). This document is what Rosemary adds so
+those sources run here, how Quadra builds and starts the library, and what has
+and has not been checked. It documents the `quadra-vr` branch of this fork; none
+of it is upstream. "Quadra" is the Rust launcher
+([QuadraHQ/quadra-rewrite](https://github.com/QuadraHQ/quadra-rewrite)); the
+Python launcher it replaced, which ran the same sources under Darling, is
+discontinued.
 
 ## What the library does
 
 `vr_device.c` finds the client's `DeviceGL` and `DebugDeviceVR` classes by RTTI,
 patches `DeviceGL`'s vtable (`beginFrame`, `setVR`) and attaches a
 `DebugDeviceVR` whose methods read poses from, and submit eyes to, OpenXR
-(`vr_xr.c`). Roblox's own VR code does the rest. See Quadra's `docs/VR.md`.
+(`vr_xr.c`). Roblox's own VR code does the rest. Quadra's side is
+`src/backend/vr.rs`.
 
 It needs four things from the host process, and Rosemary supplies each:
 
@@ -55,6 +59,14 @@ It needs four things from the host process, and Rosemary supplies each:
   return the host's symbol unmodified. Libraries are never closed. They refuse
   under `ROSEMARY_NO_PASSTHROUGH` and under the emulated backend, with a
   `quadra_host_dlerror` message. Tests: `tests/hostbridge.rs`.
+
+  Upstream has since added an opt-in API for the same job (`rosemary_host_dlopen`,
+  `rosemary_host_dlsym`, `rosemary_host_dlclose`, `rosemary_get_host_rtld_default`
+  and `rosemary_host_call_trampoline`, exported only under
+  `ROSEMARY_EXPOSE_LIBSYSTEM_EXTENSIONS=1`; `crates/darwin/src/rosemary/`). The
+  fork keeps `quadra_host_*` because Quadra's glue binds those names, and Quadra
+  decides whether a Rosemary build can do VR by finding the string
+  `ROSEMARY_DYLD_INSERT_FORCE` in its binary.
 
 ### Calling host functions from guest threads
 
@@ -103,30 +115,33 @@ every OpenXR and EGL function. VR therefore needs an x86-64 host today.
 ```sh
 # Rosemary (this branch)
 cargo build --release --bin rosemary
-
-# The VR library, from a Quadra checkout. Cross-compiles Mach-O with clang+lld
-# against the Darwin SDK that Quadra's runtime uses (DARLING_SYSROOT overrides it).
-rosemary/vr/build_rosemary_vr.sh          # -> build/libQuadraVR.dylib
-QUADRA_VR_TRACE=1 rosemary/vr/build_rosemary_vr.sh   # -> libQuadraVR-trace.dylib (also logs getState)
 ```
 
-`rosemary/vr/rosemary_glue.c` is the only Rosemary-specific source. It defines
+Quadra builds the VR library itself, in `build.rs`, when clang and `ld64.lld`
+(or Rust's `rust-lld`) are installed. Each source is compiled with
+`clang -target x86_64-apple-macos11.0 -ffreestanding -O2` and the objects are
+linked with `ld64.lld -dylib -undefined dynamic_lookup` against
+`vr/libSystem.tbd`, so no Darwin SDK is needed. The library is embedded in
+Quadra and written to `~/.cache/quadra/vr/libQuadraVR.dylib` before a VR launch.
+
+`vr/rosemary_glue.c` is the only Rosemary-specific source. It defines
 `_elfcalls`, a pointer to `{open, close, symbol}` of the shape Darling's loader
-publishes, with the three functions forwarding to `quadra_host_*`.
+published, with the three functions forwarding to `quadra_host_*`.
 `vr/vr_device.c` and `vr/vr_xr.c` are compiled unchanged.
 
 ## Running
 
-The Quadra launcher has to arrange this (host environment of the `rosemary`
-process unless noted):
+Quadra's `src/backend/vr.rs` and `src/backend/launch.rs` set this (host
+environment of the `rosemary` process unless noted):
 
 | Setting | Value |
 | --- | --- |
 | `ROSEMARY_DYLD_INSERT_LIBRARIES` | absolute host path of `libQuadraVR.dylib` |
 | `ROSEMARY_DYLD_INSERT_FORCE` | `1` |
-| `ROSEMARY_ENVIRON` | newline-separated guest variables, at least `QUADRA_VR=openxr` (or `openxr-headset`, without the window mirror) and `QUADRA_XR_RUNTIME_JSON=<runtime manifest>`; optionally `QUADRA_VR_SCALE=<percent>` and `QUADRA_VR_FOLLOW_RATE=1`. Same meaning as under Darling (`launcher/quadra/vr.py` already produces them) |
+| `ROSEMARY_ENVIRON` | newline-separated guest variables: `QUADRA_VR=openxr` (or `openxr-headset`, without the window mirror), `QUADRA_VR_SCALE=<percent>` and `QUADRA_XR_RUNTIME_JSON=<runtime manifest>`; `QUADRA_VR_FOLLOW_RATE=1` is optional |
 | `ClientAppSettings.json` | the two OpenGL flags above |
-| `SDL_VIDEO_FORCE_EGL=1` | only when SDL uses X11 |
+| `SDL_VIDEO_FORCE_EGL=1` | always set; it matters only when SDL uses X11 |
+| `MESA_LOADER_DRIVER_OVERRIDE=zink`, `__EGL_VENDOR_LIBRARY_FILENAMES=<Mesa's EGL vendor file>` | only with Quadra's OpenGL-on-Vulkan (zink) VR option |
 | `XDG_RUNTIME_DIR` | must be the runtime's: its IPC socket lives there. The library falls back to `/run/user/<uid>` |
 
 `QUADRA_XR_RUNTIME_JSON` is copied to the host's `XR_RUNTIME_JSON` through the
@@ -139,16 +154,52 @@ host's environment reaches the guest (see `usage.md`).
 
 ## Testing without a headset
 
-Quadra's `rosemary/vr/test_rosemary_vr.sh` does the whole thing: builds the
-trace library, copies the installed Roblox app and makes a new prefix in a
-temporary directory (the live prefix and its sign-in are not touched), starts
-the Monado emulator (`~/.local/share/quadrahq/vr-emulator/run-service.sh`),
-runs Roblox for 30 seconds on a private display and checks the log. Nothing
-appears on the desktop. `DISPLAY_MODE=offscreen` (default), `xvfb` or `wayland`
-choose how the window system is faked; `SCREENSHOT=file.png` with `xvfb`
-saves the mirrored eyes.
+Start the Monado emulator (`~/.local/share/quadrahq/vr-emulator/run-service.sh
+start`: a headless null compositor with a simulated HMD and controllers; with
+`IPC_LOG=trace` its log counts the runtime's side). Copy the installed
+`RobloxPlayer.app` and make a new prefix in a temporary directory, so the live
+prefix and its sign-in are not touched. Then start `rosemary <copy>.app` with
+the settings above, `QUADRA_XR_RUNTIME_JSON` pointing at the emulator's
+`monado_openxr.json` and `SDL_VIDEO_DRIVER=offscreen`, so nothing appears on the
+desktop. The library's `[Quadra VR]` lines on stderr report each stage: the
+`DeviceGL` slot, the attached device, the session's creation and states, and a
+pacing report every 900 frames.
 
 ## What has been checked
+
+### 0.5.0-quadra.2 (upstream 0b081874 merged)
+
+Roblox 0.746.0.7461264 on x86-64 Linux with an NVIDIA RTX 3060 Ti (driver
+620.70.06), SDL's offscreen driver and Monado 25.1.0's null compositor. The
+library was built the way Quadra's `build.rs` builds it and started with the
+environment `src/backend/vr.rs` sets (render scale 70 %, mirror on), in a new
+prefix. Login screen only; no game was joined.
+
+* Insertion into the hardened client is forced, `DeviceGL`'s VR slot is found
+  (+0x268, enabled flag +0x270) and the client's `DebugDeviceVR` is attached.
+  The game renders with OpenGL 4.1 through SDL's EGL.
+* The OpenXR session is created at 1008x1120 per eye (70 % of the emulator's
+  1440x1600) with the controllers bound, and goes idle, ready, synchronized,
+  visible, focused. The first 900 frames ran at 42.8 fps while shaders
+  compiled, the next 900 at 72.0 fps against 72 Hz with none late.
+* The runtime dispatched 2371 `xrWaitFrame`, 2370 `xrBeginFrame` and 2369
+  `xrEndFrame`, and 4738 swapchain acquires and releases (both eyes, every
+  frame).
+* Without VR the same client starts on Metal, through Vulkan on the NVIDIA GPU,
+  and reaches its render loop. That held in a new prefix and in a prefix made by
+  0.5.0-quadra.1 with MiniDarwin 15. A named prefix, as Quadra uses, keeps its
+  base: Rosemary offers MiniDarwin updates only for the default prefix, and
+  `rosemary prefix update` moves a named one to release 17.
+* `tests/dyld_insert.rs` and `tests/hostbridge.rs` ran, with fixtures built by a
+  `cc` stand-in around clang and `ld64.lld` against Darling's libSystem. The
+  bridge's probe does not link without `-undefined dynamic_lookup`, so with a
+  plain `cc -arch x86_64` its three tests passed without running; the test now
+  links it that way.
+
+The `getState` trace, controller input, the window-mirror screenshot, Xvfb and
+`kwin_wayland` were not repeated for this release.
+
+### 0.5.0-quadra.1
 
 Roblox 0.745.0.7451137, Rosemary 0.5.0 + this branch, x86-64 Linux, NVIDIA
 GPU, against Monado 25.1.0's headless null compositor (simulated HMD and
@@ -191,6 +242,9 @@ Run in Rosemary, evidence in the launch log and the runtime's trace:
 * GLX (X11 without `SDL_VIDEO_FORCE_EGL`), the emulated backend, aarch64 hosts,
   and Rosemary running on its bundled glibc (`ROSEMARY_GLIBC=bundled`) against
   the host's OpenXR and EGL libraries.
+* The packaged builds (the Steam-tool archive Quadra installs and the
+  AppImage, both made by the release workflow with Nix) were not run locally;
+  every check above used `cargo build --release`.
 * One test run ended with `XR_ERROR_INSTANCE_LOST` late in its 30 seconds,
   while the emulator service was shared with another job; two repeats of the
   same run (30 and 40 seconds) were clean, and the service log shows only a
