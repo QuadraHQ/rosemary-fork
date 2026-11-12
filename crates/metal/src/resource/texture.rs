@@ -40,6 +40,11 @@ impl Texture {
         }
     }
 
+    /// Whether this is a view of a buffer's memory, which has no image.
+    pub fn is_texture_buffer(&self) -> bool {
+        self.texel_view != vk::BufferView::null()
+    }
+
     /// The bytes `-[MTLDevice currentAllocatedSize]` counts this texture as.
     /// Read from the image rather than the descriptor, so that the figure a
     /// deallocation subtracts is the one its creation added.
@@ -322,6 +327,17 @@ pub(super) unsafe extern "C" fn descriptor_init(receiver: Id, _sel: Sel) -> Id {
     receiver
 }
 
+pub(super) unsafe extern "C" fn descriptor_copy(
+    receiver: Id,
+    _sel: Sel,
+    _zone: *mut std::ffi::c_void,
+) -> Id {
+    // SAFETY: a texture descriptor of this crate's, containing only values.
+    let descriptor = *unsafe { object::body::<TextureDescriptor>(receiver) };
+    // FIXME (ACCURACY): Copies always use the base class and bypass subclass initializers.
+    object::make(c"MTLTextureDescriptor", descriptor)
+}
+
 /// The level count `mipmapped:YES` asks for: the full chain down to 1x1.
 fn full_chain(width: u64, height: u64) -> u64 {
     u64::from(64 - width.max(height).max(1).leading_zeros())
@@ -424,6 +440,11 @@ pub(super) unsafe extern "C" fn replace_region(
     }
     // SAFETY: a texture of this crate's.
     let texture = unsafe { object::body::<Texture>(receiver) };
+    if texture.is_texture_buffer() {
+        // Its bytes are its buffer's, which a guest writes through
+        // `-contents`; an image copy here would name a null `VkImage`.
+        return gpu::trace("replaceRegion: of a texture buffer is not supported");
+    }
     // Every number below this line came from the guest. A region outside the
     // texture, or a size which overflows, is a Metal programming error and
     // becomes a diagnostic here rather than an invalid `vkCmdCopyBufferToImage`
@@ -488,9 +509,10 @@ pub(super) unsafe extern "C" fn replace_region(
     let alignment = lcm(texel.max(1), 16);
     let image = texture.image.image;
     let aspect = texture.image.aspect;
+    let heap = texture.image.placement.as_deref();
     let result = texture.gpu.defer(|gpu, batch| {
         let (buffer, offset) = batch.stage(gpu, source, alignment)?;
-        batch.touch(image);
+        batch.touch_subresource(gpu, image, heap, checked.level, checked.slice);
         let copy = vk::BufferImageCopy::default()
             .buffer_offset(offset)
             .buffer_row_length(row_length as u32)
@@ -554,7 +576,7 @@ struct TextureReadbackOwner {
 impl Drop for TextureReadbackOwner {
     fn drop(&mut self) {
         if let Some(staging) = self.staging.take() {
-            self.gpu.destroy_buffer(staging);
+            self.gpu.release_staging_buffer(staging);
         }
         objc::arc::release(self.texture as Id);
     }
@@ -582,6 +604,10 @@ pub(super) unsafe extern "C" fn get_bytes_slice(
     }
     // SAFETY: a texture of this crate's.
     let texture = unsafe { object::body::<Texture>(receiver) };
+    if texture.is_texture_buffer() {
+        // As for `-replaceRegion:`: there is no image to copy from.
+        return gpu::trace("getBytes: of a texture buffer is not supported".to_string());
+    }
     let image = &texture.image;
     if image.samples != vk::SampleCountFlags::TYPE_1 {
         return gpu::trace("getBytes: of a multisampled texture".to_string());
@@ -634,7 +660,7 @@ pub(super) unsafe extern "C" fn get_bytes_slice(
             checked.size[0], checked.size[1]
         ));
     }
-    let staging = match texture.gpu.create_staging_buffer(tight_image * images) {
+    let staging = match texture.gpu.acquire_staging_buffer(tight_image * images) {
         Ok(staging) => staging,
         Err(reason) => return gpu::trace(format!("getBytes: staging failed: {reason}")),
     };
@@ -708,6 +734,14 @@ pub(super) unsafe extern "C" fn get_bytes_slice(
     match result {
         Err(reason) => gpu::trace(format!("getBytes: copy failed: {reason}")),
         Ok(()) => {
+            let contents = staging.lock().unwrap().staging.as_ref().unwrap().contents;
+            if row_stride == tight_row && image_stride == tight_image {
+                // SAFETY: as below, for a region whose strides leave no gaps.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(contents, bytes, (tight_image * images) as usize)
+                };
+                return;
+            }
             for image in 0..images {
                 for row in 0..rows {
                     let from = (image * tight_image + row * tight_row) as usize;
@@ -717,14 +751,7 @@ pub(super) unsafe extern "C" fn get_bytes_slice(
                     // its own strides.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            staging
-                                .lock()
-                                .unwrap()
-                                .staging
-                                .as_ref()
-                                .unwrap()
-                                .contents
-                                .add(from),
+                            contents.add(from),
                             bytes.add(to),
                             tight_row as usize,
                         )
@@ -884,6 +911,10 @@ fn texture_view(
 ) -> Id {
     // SAFETY: a texture of this crate's.
     let texture = unsafe { object::body::<Texture>(receiver) };
+    if texture.is_texture_buffer() {
+        gpu::trace("rejecting newTextureViewWithPixelFormat: of a texture buffer");
+        return std::ptr::null_mut();
+    }
     let format = gpu::pixel_format(pixel_format);
     if format == vk::Format::UNDEFINED {
         gpu::trace(format!(

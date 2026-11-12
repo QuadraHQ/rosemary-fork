@@ -32,7 +32,9 @@ pub(super) unsafe extern "C" fn new_default_library(receiver: Id, _sel: Sel) -> 
             return std::ptr::null_mut();
         }
     };
-    retain_library(receiver, translated, Some(air), entry_modules, Some(target))
+    let library = retain_library(receiver, translated, Some(air), entry_modules, Some(target));
+    label_metallib(library, &bytes);
+    library
 }
 
 pub(super) unsafe extern "C" fn new_library_with_data(
@@ -59,7 +61,30 @@ pub(super) unsafe extern "C" fn new_library_with_data(
         Ok(result) => result,
         Err(failure) => return fail_library(error, &failure.to_string()),
     };
-    retain_library(receiver, translated, Some(air), entry_modules, Some(target))
+    let library = retain_library(receiver, translated, Some(air), entry_modules, Some(target));
+    label_metallib(library, bytes);
+    library
+}
+
+/// Name a precompiled library's entries for `ROSEMARY_METAL_PROFILE` by the
+/// hash `ROSEMARY_MSL_OUT` files the library under, since precompiled
+/// shaders tend to share one entry name.
+fn label_metallib(library: Id, bytes: &[u8]) {
+    if library.is_null() || !crate::profile::enabled() {
+        return;
+    }
+    let hash = fnv1a64(bytes);
+    if let Some(directory) = std::env::var_os("ROSEMARY_MSL_OUT") {
+        let directory = std::path::PathBuf::from(directory);
+        if std::fs::create_dir_all(&directory).is_ok() {
+            let _ = std::fs::write(directory.join(format!("air-{hash:016x}.metallib")), bytes);
+        }
+    }
+    // SAFETY: a library just made by `retain_library`.
+    let library = unsafe { object::body::<Library>(library) };
+    for (index, entry) in library.translated.entries.iter().enumerate() {
+        crate::profile::label_entry(entry, format!("air-{hash:016x}#{index}:{}", entry.name));
+    }
 }
 
 fn translate_metallib<'a>(
@@ -145,33 +170,24 @@ pub(super) unsafe extern "C" fn new_library_with_source(
     options: Id,
     error: *mut Id,
 ) -> Id {
-    if !error.is_null() {
-        // SAFETY: the guest passed a writable `NSError **`.
-        unsafe { *error = std::ptr::null_mut() };
-    }
-    if source.is_null() {
-        return fail_library(error, "newLibraryWithSource: requires an NSString source");
-    }
-    // SAFETY: an `RosemaryMTLDevice`.
-    let target = unsafe { object::body::<Device>(receiver) }.target;
-    // SAFETY: the profile belongs to the process-wide adapter list.
-    let Some(target) = (unsafe { target.as_ref() }) else {
-        return fail_library(error, "Metal device has no Vulkan target profile");
-    };
+    // SAFETY: a guest `NSString`, and an options object or nil.
+    let (source, macros) = unsafe { source_inputs(source, options) };
+    // SAFETY: the caller's error slot.
+    unsafe { library_from_source(receiver, source.as_deref(), &macros, error) }
+}
 
-    // SAFETY: a guest `NSString`.
-    let source = unsafe { foundation::string::bytes(source) };
-    if source.is_empty() {
-        return fail_library(
-            error,
-            "newLibraryWithSource: received an empty or invalid NSString",
-        );
-    }
-    let Ok(source) = std::str::from_utf8(&source) else {
-        return fail_library(error, "Metal source is not valid UTF-8");
-    };
-    report_source_library(source);
-    dump_source_library(source);
+/// What `newLibraryWithSource:options:` reads of its arguments: the source's
+/// bytes, `None` for nil, and the preprocessor macros.
+///
+/// # Safety
+///
+/// `source` must be null or an `NSString`, `options` null or an object.
+pub(super) unsafe fn source_inputs(
+    source: Id,
+    options: Id,
+) -> (Option<Vec<u8>>, Vec<(String, String)>) {
+    // SAFETY: the caller's contract.
+    let source = (!source.is_null()).then(|| unsafe { foundation::string::bytes(source) });
     let macros = if object::is_kind(options, c"MTLCompileOptions") {
         // SAFETY: an options object of this crate's.
         unsafe { object::body::<crate::pipeline::CompileOptions>(options) }
@@ -180,9 +196,48 @@ pub(super) unsafe extern "C" fn new_library_with_source(
     } else {
         Vec::new()
     };
+    (source, macros)
+}
+
+/// `newLibraryWithSource:options:error:` over the inputs it read.
+///
+/// # Safety
+///
+/// `receiver` must be an `RosemaryMTLDevice`, and `error` null or writable.
+pub(super) unsafe fn library_from_source(
+    receiver: Id,
+    source: Option<&[u8]>,
+    macros: &[(String, String)],
+    error: *mut Id,
+) -> Id {
+    if !error.is_null() {
+        // SAFETY: the caller's contract.
+        unsafe { *error = std::ptr::null_mut() };
+    }
+    let Some(source) = source else {
+        return fail_library(error, "newLibraryWithSource: requires an NSString source");
+    };
+    // SAFETY: an `RosemaryMTLDevice`.
+    let target = unsafe { object::body::<Device>(receiver) }.target;
+    // SAFETY: the profile belongs to the process-wide adapter list.
+    let Some(target) = (unsafe { target.as_ref() }) else {
+        return fail_library(error, "Metal device has no Vulkan target profile");
+    };
+
+    if source.is_empty() {
+        return fail_library(
+            error,
+            "newLibraryWithSource: received an empty or invalid NSString",
+        );
+    }
+    let Ok(source) = std::str::from_utf8(source) else {
+        return fail_library(error, "Metal source is not valid UTF-8");
+    };
+    report_source_library(source);
+    dump_source_library(source);
     let translated = match metal_translate::translate_msl_cached_with_macros(
         source,
-        &macros,
+        macros,
         target,
         metal_translate::PassPipeline::from_env(),
     ) {
@@ -246,13 +301,50 @@ pub(super) unsafe extern "C" fn new_function_with_constants(
     constants: Id,
     error: *mut Id,
 ) -> Id {
+    // SAFETY: a guest `NSString`, and a constant values object or nil.
+    let (name, values) = unsafe { constant_inputs(name, constants) };
+    // SAFETY: the caller's error slot.
+    unsafe { function_with_constants(receiver, &name, values, error) }
+}
+
+/// What `newFunctionWithName:constantValues:` reads of its arguments.
+///
+/// # Safety
+///
+/// `name` must be null or an `NSString`, `constants` null or an object.
+pub(super) unsafe fn constant_inputs(
+    name: Id,
+    constants: Id,
+) -> (Vec<u8>, metal_translate::FunctionConstantValues) {
+    // SAFETY: the caller's contract.
+    let name = unsafe { foundation::string::bytes(name) };
+    let values = if object::is_kind(constants, c"MTLFunctionConstantValues") {
+        // SAFETY: checked above.
+        unsafe { object::body::<ConstantValues>(constants) }
+            .values
+            .clone()
+    } else {
+        metal_translate::FunctionConstantValues::new()
+    };
+    (name, values)
+}
+
+/// `newFunctionWithName:constantValues:error:` over the inputs it read.
+///
+/// # Safety
+///
+/// `receiver` must be an `RosemaryMTLLibrary`, and `error` null or writable.
+pub(super) unsafe fn function_with_constants(
+    receiver: Id,
+    name: &[u8],
+    values: metal_translate::FunctionConstantValues,
+    error: *mut Id,
+) -> Id {
     if !error.is_null() {
-        // SAFETY: the guest passed a writable `NSError **`.
+        // SAFETY: the caller's contract.
         unsafe { *error = std::ptr::null_mut() };
     }
-    // SAFETY: a guest `NSString`.
-    let name = unsafe { foundation::string::bytes(name) };
-    let Ok(name) = std::str::from_utf8(&name) else {
+    let Ok(name) = std::str::from_utf8(name) else {
         return fail_library(
             error,
             "newFunctionWithName: names a function in invalid UTF-8",
@@ -293,14 +385,6 @@ pub(super) unsafe extern "C" fn new_function_with_constants(
             else {
                 return fail_library(error, "the function has no owning AIR module");
             };
-            let values = if object::is_kind(constants, c"MTLFunctionConstantValues") {
-                // SAFETY: checked above.
-                unsafe { object::body::<ConstantValues>(constants) }
-                    .values
-                    .clone()
-            } else {
-                metal_translate::FunctionConstantValues::new()
-            };
             let translated = metal_translate::translate_specialized_cached(
                 metal_translate::AirInput::Bitcode(air),
                 target,
@@ -332,14 +416,24 @@ pub(super) unsafe extern "C" fn new_function_with_constants(
         }
         _ => None,
     };
-    object::make(
+    let function = object::make(
         c"RosemaryMTLFunction",
         Function {
             library: objc::arc::retain(receiver),
             entry,
             specialized,
         },
-    )
+    );
+    if crate::profile::enabled() && !function.is_null() {
+        // SAFETY: the function just made, whose library is alive.
+        let function = unsafe { object::body::<Function>(function) };
+        if let (Some(specialized), Some(base)) =
+            (&function.specialized, library.translated.entries.get(entry))
+        {
+            crate::profile::label_specialized(specialized, base);
+        }
+    }
+    function
 }
 
 /// `-[MTLLibrary functionNames]`: the entry points the translation produced,

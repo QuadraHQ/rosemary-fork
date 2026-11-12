@@ -7,6 +7,9 @@ pub mod signal;
 pub mod memory {
     pub use crate::memory::piped::{read, write};
 
+    /// Removed in FreeBSD 11, which always overcommits anonymous memory.
+    pub const NORESERVE: libc::c_int = 0;
+
     pub fn object() -> std::io::Result<std::os::fd::OwnedFd> {
         use std::os::fd::FromRawFd;
         // SAFETY: a NUL-terminated name, which only labels the object.
@@ -261,6 +264,12 @@ pub fn regions(pid: i32) -> io::Result<Vec<Region>> {
 /// subsystem configured; without it there is nothing to report.
 pub fn audit() -> Audit {
     Audit::default()
+}
+
+// `p_comm` is copied from the executable at `exec` and nothing changes it
+// after; `setproctitle` rewrites the arguments, not the name.
+pub fn set_name(_name: &CStr) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
 }
 
 pub fn memory() -> Memory {

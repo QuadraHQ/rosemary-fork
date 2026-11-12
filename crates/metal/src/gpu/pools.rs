@@ -150,7 +150,7 @@ impl Gpu {
                 .reset_command_pool(context.pool, vk::CommandPoolResetFlags::empty())
         };
         let mut contexts = self.contexts.lock().expect("command contexts");
-        if reset.is_ok() && contexts.len() < RECYCLED {
+        if reset.is_ok() && contexts.len() < self.context_budget.recycled_contexts() {
             contexts.push(context);
             return;
         }
@@ -278,18 +278,67 @@ impl Gpu {
     }
 
     /// A host-visible buffer of [`UPLOAD_CHUNK`] bytes for small copies.
+    ///
+    /// Not zeroed: a descriptor or copy only ever covers bytes an upload
+    /// wrote, and a recycled chunk holds earlier uploads anyway.
     pub fn acquire_upload_chunk(&self) -> Result<GpuBuffer, String> {
-        if let Some(chunk) = self.upload_chunks.lock().expect("upload chunks").pop() {
+        if let Some((chunk, _)) = self.upload_chunks.lock().expect("upload chunks").pop() {
             return Ok(chunk);
         }
-        self.create_buffer(UPLOAD_CHUNK)
+        self.create_staging_buffer(UPLOAD_CHUNK)
+    }
+
+    /// A host-visible buffer of at least `length` bytes whose contents the
+    /// caller overwrites, recycled rather than made per transfer: streaming
+    /// textures in would otherwise create and free a buffer for each.
+    pub fn acquire_staging_buffer(&self, length: u64) -> Result<GpuBuffer, String> {
+        let mut pool = self.staging_buffers.lock().expect("staging buffers");
+        let idle = take_idle_staging(&mut pool);
+        let fit = (0..pool.len())
+            .filter(|at| pool[*at].0.length >= length)
+            .min_by_key(|at| pool[*at].0.length);
+        let found = fit.map(|at| pool.swap_remove(at).0);
+        drop(pool);
+        idle.into_iter()
+            .for_each(|buffer| self.destroy_buffer(buffer));
+        match found {
+            Some(buffer) => Ok(buffer),
+            None => self.create_staging_buffer(length),
+        }
+    }
+
+    /// Hand back a staging buffer no pending submission still uses.
+    pub fn release_staging_buffer(&self, buffer: GpuBuffer) {
+        let mut pool = self.staging_buffers.lock().expect("staging buffers");
+        let mut idle = take_idle_staging(&mut pool);
+        let held: u64 = pool.iter().map(|(buffer, _)| buffer.length).sum();
+        if held + buffer.length <= STAGING_POOL_BYTES {
+            pool.push((buffer, std::time::Instant::now()));
+        } else {
+            idle.push(buffer);
+        }
+        drop(pool);
+        idle.into_iter()
+            .for_each(|buffer| self.destroy_buffer(buffer));
+    }
+
+    /// Free the pooled staging buffers and upload chunks left unused for
+    /// [`STAGING_IDLE`].
+    pub(super) fn trim_staging_buffers(&self) {
+        let mut idle =
+            take_idle_staging(&mut self.staging_buffers.lock().expect("staging buffers"));
+        idle.extend(take_idle_staging(
+            &mut self.upload_chunks.lock().expect("upload chunks"),
+        ));
+        idle.into_iter()
+            .for_each(|buffer| self.destroy_buffer(buffer));
     }
 
     /// Hand back an upload chunk no pending submission still reads.
     pub fn release_upload_chunk(&self, chunk: GpuBuffer) {
         let mut chunks = self.upload_chunks.lock().expect("upload chunks");
-        if chunks.len() < RECYCLED / 2 {
-            chunks.push(chunk);
+        if chunks.len() < self.context_budget.recycled_upload_chunks() {
+            chunks.push((chunk, std::time::Instant::now()));
             return;
         }
         drop(chunks);
@@ -303,4 +352,17 @@ impl Gpu {
     pub fn timestamp_valid_bits(&self) -> u32 {
         self.timestamp_valid_bits
     }
+}
+
+/// Take out the pooled staging buffers unused for longer than [`STAGING_IDLE`].
+fn take_idle_staging(pool: &mut Vec<(GpuBuffer, std::time::Instant)>) -> Vec<GpuBuffer> {
+    let mut idle = Vec::new();
+    let mut at = 0;
+    while at < pool.len() {
+        match pool[at].1.elapsed() > STAGING_IDLE {
+            true => idle.push(pool.swap_remove(at).0),
+            false => at += 1,
+        }
+    }
+    idle
 }

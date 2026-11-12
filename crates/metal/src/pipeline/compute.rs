@@ -7,8 +7,10 @@ pub(crate) struct ComputePipeline {
     pub name: std::ffi::CString,
     pub layouts: Layouts,
     pub resources: Vec<ResourceBinding>,
+    /// Parallel to `resources`.
+    pub inline_samplers: Vec<vk::Sampler>,
     /// One Vulkan pipeline per threadgroup size the guest has dispatched.
-    variants: Mutex<HashMap<[u32; 3], vk::Pipeline>>,
+    variants: Mutex<crate::hash::FastMap<[u32; 3], vk::Pipeline>>,
     /// `ROSEMARY_METAL_PROFILE`: what its dispatches are totalled under.
     pub profile_label: Option<std::sync::Arc<str>>,
 }
@@ -29,15 +31,23 @@ impl ComputePipeline {
                 .map_err(|_| "entry point name contains a NUL".to_string())?,
             layouts,
             resources: entry.resources.clone(),
-            variants: Mutex::new(HashMap::new()),
+            inline_samplers: inline_samplers(gpu, &entry.resources),
+            variants: Mutex::new(Default::default()),
             profile_label: crate::profile::pipeline_label(&[entry]),
         })
     }
 
     /// The Vulkan pipeline for one Metal threadgroup size.
     pub fn variant(&self, size: [u32; 3]) -> Result<vk::Pipeline, String> {
-        let mut cache = self.variants.lock().expect("compute pipeline cache");
-        if let Some(pipeline) = cache.get(&size) {
+        // Compiled without the lock held: a driver can take tens of
+        // milliseconds, and other encoders drawing with this state must not
+        // wait on a variant they do not need.
+        if let Some(pipeline) = self
+            .variants
+            .lock()
+            .expect("compute pipeline cache")
+            .get(&size)
+        {
             return Ok(*pipeline);
         }
         let entries = metal_translate::WORKGROUP_SIZE_SPEC_IDS
@@ -72,11 +82,20 @@ impl ComputePipeline {
         let pipeline = crate::stats::pipeline(|| unsafe {
             self.gpu
                 .device
-                .create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
+                .create_compute_pipelines(self.gpu.pipeline_cache(), &[info], None)
         })
         .map_err(|(_, error)| format!("vkCreateComputePipelines failed with {error:?}"))?[0];
-        cache.insert(size, pipeline);
-        Ok(pipeline)
+        self.gpu.pipeline_created();
+        let mut cache = self.variants.lock().expect("compute pipeline cache");
+        match cache.entry(size) {
+            std::collections::hash_map::Entry::Occupied(made) => {
+                // Another thread compiled it first; this one was never recorded.
+                // SAFETY: a pipeline of this device's which nothing refers to.
+                unsafe { self.gpu.device.destroy_pipeline(pipeline, None) };
+                Ok(*made.get())
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => Ok(*slot.insert(pipeline)),
+        }
     }
 }
 

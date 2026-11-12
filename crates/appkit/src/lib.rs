@@ -27,7 +27,6 @@ mod cell;
 pub mod cgcontext;
 pub mod cgevent;
 pub mod cgfont;
-pub mod cgl;
 pub mod cgpaint;
 pub mod cgpath;
 pub mod classes;
@@ -356,26 +355,6 @@ exports::exports! {
         "LMGetKbdType" => textinput::LMGetKbdType,
         "LMGetKbdLast" => textinput::LMGetKbdLast,
         "UCKeyTranslate" => textinput::UCKeyTranslate,
-        "CGLChoosePixelFormat" => opengl::CGLChoosePixelFormat,
-        "CGLDestroyPixelFormat" => opengl::CGLDestroyPixelFormat,
-        "CGLCreateContext" => opengl::CGLCreateContext,
-        "CGLDestroyContext" => opengl::CGLDestroyContext,
-        "CGLReleaseContext" => opengl::CGLReleaseContext,
-        "CGLRetainContext" => opengl::CGLRetainContext,
-        "CGLGetPixelFormat" => opengl::CGLGetPixelFormat,
-        "CGLErrorString" => opengl::CGLErrorString,
-        "CGLGetVersion" => opengl::CGLGetVersion,
-        "CGLEnable" => opengl::CGLEnable,
-        "CGLDisable" => opengl::CGLDisable,
-        "CGLGetParameter" => opengl::CGLGetParameter,
-        "CGLSetParameter" => opengl::CGLSetParameter,
-        "CGLSetCurrentContext" => opengl::CGLSetCurrentContext,
-        "CGLGetCurrentContext" => opengl::CGLGetCurrentContext,
-        "CGLFlushDrawable" => opengl::CGLFlushDrawable,
-        "CGLClearDrawable" => opengl::CGLClearDrawable,
-        "CGLLockContext" => opengl::CGLLockContext,
-        "CGLUnlockContext" => opengl::CGLUnlockContext,
-        "CGLGetShareGroup" => opengl::CGLGetShareGroup,
     }
     groups {
         ctline,
@@ -387,7 +366,6 @@ exports::exports! {
         cgcontext,
         cgpath,
         cgpaint,
-        cgl,
     }
 }
 
@@ -738,6 +716,8 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     // The drag pasteboard's name, which is Apple's string and not the symbol's:
     // a program naming the board by hand has to name the same one.
     ("_NSPasteboardNameDrag", "Apple CFPasteboard drag"),
+    ("_NSPasteboardNameGeneral", "Apple CFPasteboard general"),
+    ("_NSPasteboardNameFind", "Apple CFPasteboard find"),
     // Attributed-string attribute names. Each is shorter than its symbol, as
     // `NSForegroundColorAttributeName` above already is.
     ("_NSUnderlineStyleAttributeName", "NSUnderline"),

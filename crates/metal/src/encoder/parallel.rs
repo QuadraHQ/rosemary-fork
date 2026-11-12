@@ -49,7 +49,7 @@ pub(super) unsafe extern "C" fn new_sub_encoder(receiver: Id, _sel: Sel) -> Id {
     let parallel = unsafe { object::body::<ParallelEncoder>(receiver) };
     // SAFETY: the inner encoder is a render encoder of this crate's.
     let inner = unsafe { object::body::<Encoder>(parallel.inner) };
-    let Some((pass, framebuffer, area)) = inner.inheritance else {
+    let Some((inheritance, area)) = &inner.inheritance else {
         // The pass never began: every sub-encoder records nothing.
         return std::ptr::null_mut();
     };
@@ -62,28 +62,15 @@ pub(super) unsafe extern "C" fn new_sub_encoder(receiver: Id, _sel: Sel) -> Id {
             return std::ptr::null_mut();
         }
     };
-    let inheritance = vk::CommandBufferInheritanceInfo::default()
-        .render_pass(pass)
-        .subpass(0)
-        .framebuffer(framebuffer);
-    let begin = vk::CommandBufferBeginInfo::default()
-        .flags(
-            vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT
-                | vk::CommandBufferUsageFlags::RENDER_PASS_CONTINUE,
-        )
-        .inheritance_info(&inheritance);
-    // SAFETY: the command buffer is fresh or was reset with its pool.
-    if let Err(error) = unsafe {
-        gpu.device
-            .begin_command_buffer(context.command_buffer, &begin)
-    } {
+    let command_buffer = context.command_buffer;
+    let area = *area;
+    if let Err(error) = inheritance.begin_secondary(&gpu.device, command_buffer) {
         gpu::trace(format!(
             "vkBeginCommandBuffer (secondary) failed with {error:?}"
         ));
         gpu.release_secondary(context);
         return std::ptr::null_mut();
     }
-    record_pass_defaults(&gpu.device, context.command_buffer, area);
     let child = object::make(
         c"RosemaryMTLCommandBuffer",
         CommandBuffer {
@@ -96,10 +83,14 @@ pub(super) unsafe extern "C" fn new_sub_encoder(receiver: Id, _sel: Sel) -> Id {
             batches: Vec::new(),
             waits: Vec::new(),
             descriptor_pools: Vec::new(),
+            written_sets: Default::default(),
+            hazards: Hazards::default(),
             retained: Vec::new(),
             retained_set: AddressSet::default(),
             uploads: Vec::new(),
             upload_used: 0,
+            snapshots: Vec::new(),
+            staging: Vec::new(),
             framebuffers: Vec::new(),
             secondaries: Vec::new(),
             secondary: true,
@@ -126,6 +117,7 @@ pub(super) unsafe extern "C" fn new_sub_encoder(receiver: Id, _sel: Sel) -> Id {
     sub.resolve_mask = inner.resolve_mask;
     sub.depth_resolve = inner.depth_resolve;
     sub.visibility = inner.visibility;
+    record_pass_defaults(&gpu.device, command_buffer, area, &mut sub.depth_bias);
     parallel.children.push(child);
     encoder
 }
@@ -171,10 +163,13 @@ pub(super) unsafe extern "C" fn end_parallel_encoding(receiver: Id, sel: Sel) {
         if command.recording {
             command.recording = false;
             executed.push(command.command_buffer);
+            command.written_sets.clear();
             parent
                 .descriptor_pools
                 .append(&mut command.descriptor_pools);
             parent.uploads.append(&mut command.uploads);
+            parent.snapshots.append(&mut command.snapshots);
+            parent.staging.append(&mut command.staging);
             parent.occlusion.adopt(&mut command.occlusion);
             command.retained_set.clear();
             parent.retained.append(&mut command.retained);

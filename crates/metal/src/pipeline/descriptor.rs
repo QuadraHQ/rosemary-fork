@@ -86,8 +86,12 @@ impl crate::resource::Element for ColorElement {
 pub(super) unsafe extern "C" fn descriptor_init(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: a render pipeline descriptor of this crate's. This is `-reset`
     // as well as `-init`, and a reset descriptor still owns what it holds.
-    unsafe { release_descriptor_contents(receiver, false) };
-    *unsafe { object::body::<RenderPipelineDescriptor>(receiver) } = RenderPipelineDescriptor {
+    unsafe { release_descriptor_objects(receiver) };
+    let descriptor = unsafe { object::body::<RenderPipelineDescriptor>(receiver) };
+    // A `-colorAttachments` taken before the reset stays this descriptor's,
+    // and its elements read the reset values through it.
+    let color_objects = descriptor.color_objects;
+    *descriptor = RenderPipelineDescriptor {
         vertex_function: std::ptr::null_mut(),
         fragment_function: std::ptr::null_mut(),
         vertex_descriptor: std::ptr::null_mut(),
@@ -98,21 +102,19 @@ pub(super) unsafe extern "C" fn descriptor_init(receiver: Id, _sel: Sel) -> Id {
         alpha_to_coverage: false,
         alpha_to_one: false,
         rasterization: true,
-        color_objects: std::ptr::null_mut(),
+        input_topology: 0,
+        color_objects,
     };
     receiver
 }
 
-/// Give up every reference a render pipeline descriptor holds.
-///
-/// `orphaning` only where the descriptor itself is going: `-reset` leaves it
-/// alive, and Metal keeps setting through a `-colorAttachments` a guest took
-/// before the reset.
+/// Give up the functions and vertex descriptor a render pipeline descriptor
+/// holds.
 ///
 /// # Safety
 ///
 /// `receiver` must be a `MTLRenderPipelineDescriptor` of this crate's.
-unsafe fn release_descriptor_contents(receiver: Id, orphaning: bool) {
+unsafe fn release_descriptor_objects(receiver: Id) {
     let descriptor = unsafe { object::body::<RenderPipelineDescriptor>(receiver) };
     for slot in [
         &mut descriptor.vertex_function,
@@ -121,19 +123,47 @@ unsafe fn release_descriptor_contents(receiver: Id, orphaning: bool) {
     ] {
         objc::arc::release(std::mem::replace(slot, std::ptr::null_mut()));
     }
-    // The colour attachments point back at this descriptor, and a guest may
-    // hold one after releasing it: orphan them before the body goes.
-    let collection = std::mem::replace(&mut descriptor.color_objects, std::ptr::null_mut());
-    if orphaning {
-        crate::resource::orphan(collection);
-    }
-    objc::arc::release(collection);
+}
+
+/// A new descriptor with the values `source` has now, owned by the caller,
+/// for work which reads it after its maker may have changed it.
+///
+/// # Safety
+///
+/// `source` must be a `MTLRenderPipelineDescriptor` of this crate's.
+pub(crate) unsafe fn copy_render_pipeline_descriptor(source: Id) -> Id {
+    // SAFETY: the caller's contract.
+    let source = unsafe { object::body::<RenderPipelineDescriptor>(source) };
+    let vertex_descriptor = if source.vertex_descriptor.is_null() {
+        std::ptr::null_mut()
+    } else {
+        // SAFETY: a descriptor only holds a vertex descriptor of this crate's.
+        unsafe { crate::resource::copy_vertex_descriptor(source.vertex_descriptor) }
+    };
+    object::make(
+        c"MTLRenderPipelineDescriptor",
+        RenderPipelineDescriptor {
+            vertex_function: objc::arc::retain(source.vertex_function),
+            fragment_function: objc::arc::retain(source.fragment_function),
+            vertex_descriptor,
+            color_objects: std::ptr::null_mut(),
+            ..*source
+        },
+    )
 }
 
 /// `-[MTLRenderPipelineDescriptor dealloc]`.
 pub(super) unsafe extern "C" fn descriptor_dealloc(receiver: Id, _sel: Sel) {
     // SAFETY: a render pipeline descriptor of this crate's.
-    unsafe { release_descriptor_contents(receiver, true) };
+    unsafe { release_descriptor_objects(receiver) };
+    // The colour attachments point back at this descriptor, and a guest may
+    // hold one after releasing it: orphan them before the body goes.
+    let collection = std::mem::replace(
+        &mut unsafe { object::body::<RenderPipelineDescriptor>(receiver) }.color_objects,
+        std::ptr::null_mut(),
+    );
+    crate::resource::orphan(collection);
+    objc::arc::release(collection);
     objc::arc::finalize(receiver);
 }
 
@@ -189,6 +219,7 @@ pub(super) unsafe extern "C" fn descriptor_number(receiver: Id, sel: Sel) -> u64
         b"isAlphaToCoverageEnabled" => u64::from(descriptor.alpha_to_coverage),
         b"isAlphaToOneEnabled" => u64::from(descriptor.alpha_to_one),
         b"isRasterizationEnabled" => u64::from(descriptor.rasterization),
+        b"inputPrimitiveTopology" => descriptor.input_topology,
         _ => 0,
     }
 }
@@ -204,6 +235,7 @@ pub(super) unsafe extern "C" fn set_descriptor_number(receiver: Id, sel: Sel, va
         b"setAlphaToCoverageEnabled:" => descriptor.alpha_to_coverage = value & 0xff != 0,
         b"setAlphaToOneEnabled:" => descriptor.alpha_to_one = value & 0xff != 0,
         b"setRasterizationEnabled:" => descriptor.rasterization = value & 0xff != 0,
+        b"setInputPrimitiveTopology:" => descriptor.input_topology = value,
         _ => (),
     }
 }
@@ -253,5 +285,46 @@ pub(super) unsafe extern "C" fn set_color_value(receiver: Id, sel: Sel, value: u
         b"setAlphaBlendOperation:" => color.alpha_operation = value,
         b"setWriteMask:" => color.write_mask = value,
         _ => (),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn color_attachments_held_across_reset_are_orphaned_when_their_descriptor_goes() {
+        crate::bootstrap();
+        let descriptor = object::make(
+            c"MTLRenderPipelineDescriptor",
+            RenderPipelineDescriptor {
+                vertex_function: std::ptr::null_mut(),
+                fragment_function: std::ptr::null_mut(),
+                vertex_descriptor: std::ptr::null_mut(),
+                colors: [ColorAttachment::fresh(); COLOR_ATTACHMENTS],
+                depth_format: 0,
+                stencil_format: 0,
+                sample_count: 1,
+                alpha_to_coverage: false,
+                alpha_to_one: false,
+                rasterization: true,
+                input_topology: 0,
+                color_objects: std::ptr::null_mut(),
+            },
+        );
+        let get = objc::sel::get("colorAttachments");
+        // SAFETY: the registered methods of a descriptor this test made.
+        unsafe {
+            let colors = objc::arc::retain(color_attachments(descriptor, get));
+            let element = object::body::<crate::resource::IndexedCollection>(colors).elements[0];
+            set_color_value(element, objc::sel::get("setPixelFormat:"), 80);
+            descriptor_init(descriptor, objc::sel::get("reset"));
+            assert_eq!(color_attachments(descriptor, get), colors);
+            assert_eq!(color_value(element, objc::sel::get("pixelFormat")), 0);
+
+            objc::arc::release(descriptor);
+            assert!(object::body::<ColorElement>(element).owner.is_null());
+            objc::arc::release(colors);
+        }
     }
 }

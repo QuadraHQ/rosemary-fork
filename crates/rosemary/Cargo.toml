@@ -33,9 +33,12 @@ webkit.workspace = true
 forcefeedback.workspace = true
 network.workspace = true
 opencl.workspace = true
+opengl.workspace = true
 metal.workspace = true
 videotoolbox.workspace = true
+starnix.workspace = true
 gimli.workspace = true
+sha2.workspace = true
 libc.workspace = true
 static_init.workspace = true
 clap = { version = "4", features = ["derive"] }
@@ -52,3 +55,6 @@ mimalloc = { version = "0.1.52", features = ["override"] }
 [dev-dependencies]
 libc.workspace = true
 darwin.workspace = true
+
+[lints]
+workspace = true

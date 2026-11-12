@@ -109,7 +109,7 @@ pub fn check_in(path: &str, argv: Vec<Vec<u8>>) {
 }
 
 /// This process, described without the server.
-fn me() -> Option<Process> {
+pub fn me() -> Option<Process> {
     let _host = crate::syscall::ScopedHostSyscallContext::new();
     let host = starnix::process::process(host_self())?;
     let (path, argv) = match ME.get() {
@@ -386,6 +386,9 @@ const _: () = {
     assert!(offset_of!(Eproc, e_login) == 616 - 296);
     assert!(size_of::<KinfoProc>() == 648);
 };
+
+/// The size of one record [`select`] returns.
+pub(crate) const KINFO_PROC_LEN: usize = size_of::<KinfoProc>();
 
 /// `p_flag` bits.
 const P_CONTROLT: i32 = 0x0000_0002;

@@ -16,7 +16,7 @@ mod mutability {
 }
 
 /// `CFPropertyListFormat`, as `*format` reports it.
-mod format {
+pub(crate) mod format {
     pub const XML_V1_0: i64 = 100;
     pub const BINARY_V1_0: i64 = 200;
 }
@@ -65,11 +65,16 @@ fn build(value: &Value, mutability: u64, depth: usize) -> Result<CFTypeRef, Stri
             return Err("the document holds a null, which is not a property list type".into());
         }
         Value::Array(values) => {
-            let elements = values
-                .iter()
-                .map(|v| build(v, mutability, depth + 1))
-                .collect::<Result<Vec<_>, _>>();
-            let elements = elements?;
+            let mut elements = Vec::with_capacity(values.len());
+            for value in values {
+                match build(value, mutability, depth + 1) {
+                    Ok(element) => elements.push(element),
+                    Err(why) => {
+                        release_each(&elements);
+                        return Err(why);
+                    }
+                }
+            }
             let array =
                 collections::new_array(&elements, Policy::from_type_callbacks(), containers);
             release_each(&elements);
@@ -180,7 +185,7 @@ unsafe fn value_at(object: CFTypeRef, depth: usize) -> Option<Value> {
                 .map(Value::Array);
         }
         if let Some(dictionary) = collections::dictionary(object) {
-            let entries = dictionary.entries.clone();
+            let entries = dictionary.entries().to_vec();
             let mut out = std::collections::BTreeMap::new();
             for (key, value) in entries {
                 let Value::String(key) = value_at(key, depth + 1)? else {
@@ -373,7 +378,7 @@ pub unsafe extern "C" fn CFPropertyListCreateData(
     _allocator: CFAllocatorRef,
     list: CFTypeRef,
     format: CFIndex,
-    _options: u64,
+    _options: usize,
     error: *mut CFTypeRef,
 ) -> CFTypeRef {
     if !error.is_null() {
@@ -401,7 +406,6 @@ pub unsafe extern "C" fn CFPropertyListCreateData(
 
 exports::exports! {
     functions {
-        "CFPropertyListCreateData" => CFPropertyListCreateData,
         "CFPropertyListCreateWithData" => CFPropertyListCreateWithData,
         "CFPropertyListCreateFromXMLData" => CFPropertyListCreateFromXMLData,
     }
@@ -432,7 +436,7 @@ mod tests {
         assert_eq!(format, 100);
         // SAFETY: a dictionary this call returned.
         let dictionary = unsafe { collections::dictionary(list) }.expect("a dictionary");
-        assert_eq!(dictionary.entries.len(), 4);
+        assert_eq!(dictionary.len(), 4);
         assert!(!dictionary.mutable);
         unsafe { api::CFRelease(list) };
         unsafe { api::CFRelease(data) };

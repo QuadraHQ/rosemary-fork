@@ -93,6 +93,7 @@ pub unsafe fn dispose_instance(object: Id) {
     unsafe { destruct_instance(object) };
     // SAFETY: the object is still readable, which is what names its class.
     unsafe { crate::census::freed(object) };
+    crate::arc::forget_count(object);
     if crate::debug::finalized(object) {
         return;
     }
@@ -117,8 +118,13 @@ pub unsafe fn class_of(object: Id) -> Option<&'static Class> {
     crate::debug::validate(object, "object_getClass");
     // SAFETY: the caller's obligation; the first word is the `isa`.
     let isa = unsafe { *(object as *const *const Class) };
-    // SAFETY: an `isa` is a leaked `Class` or null.
-    unsafe { crate::class::from_ptr(isa) }
+    if crate::class::is_known(isa) {
+        // SAFETY: a class this runtime built or adopted.
+        return Some(unsafe { &*isa });
+    }
+    // Asked of objects that are not this runtime's too - retain probes every
+    // object it is handed - so anything else is no class, not a failure.
+    crate::class::realize(isa, object.cast())
 }
 
 /// Replace `object`'s class, returning the one it had.

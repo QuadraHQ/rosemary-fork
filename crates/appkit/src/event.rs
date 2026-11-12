@@ -23,6 +23,7 @@ pub fn pump(app: Id) {
     while let Some(event) = sdl3::video::poll() {
         deliver(event);
     }
+    sdl3::pointer::service();
     service_presentation();
     // General pump hooks may run guest code and are not modal-safe.
     let hooks = PUMP_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -741,6 +742,50 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                 ..Fields::default()
             });
         }
+        Event::Pinch {
+            window: id,
+            scale,
+            phase,
+        } => {
+            use sdl3::video::PinchPhase;
+            let (phase, magnification) = match phase {
+                PinchPhase::Began => (nsevent::phase::BEGAN, 0.0),
+                PinchPhase::Changed if scale.is_finite() && scale > 0.0 => {
+                    (nsevent::phase::CHANGED, f64::from(scale) - 1.0)
+                }
+                PinchPhase::Changed => return,
+                PinchPhase::Ended => (nsevent::phase::ENDED, 0.0),
+            };
+            // SDL's Cocoa backend can report a pinch without a window ID.
+            let id = if id == 0 {
+                let pointer = POINTER_WINDOW.load(std::sync::atomic::Ordering::Relaxed);
+                if !object_for(pointer).is_null() {
+                    pointer
+                } else {
+                    // SAFETY: null or a live window of this crate's.
+                    let sdl = unsafe { window::sdl_window(window::key_window()) };
+                    if sdl.is_null() {
+                        return;
+                    }
+                    sdl3::video::window_id(sdl)
+                }
+            } else {
+                id
+            };
+            let at = pointer_position();
+            if !mouse_inside_logical_window(id, at.0, at.1) {
+                return;
+            }
+            send(id, Some(at), |window, location| Fields {
+                kind: kind::MAGNIFY,
+                modifiers: current_modifiers(),
+                location,
+                magnification,
+                phase,
+                window,
+                ..Fields::default()
+            });
+        }
         Event::Other(_) => {}
     }
 }
@@ -1147,6 +1192,113 @@ fn log_route(window: Id, event: Id, kind: u64) {
     ));
 }
 
+/// A button that is down: the window it was pressed in and the view, retained,
+/// that took the press.
+#[derive(Clone, Copy)]
+struct Press {
+    window: Id,
+    view: Id,
+}
+
+/// The buttons AppKit tells apart by event type.
+#[derive(Clone, Copy)]
+enum Button {
+    Left,
+    Right,
+    Other,
+}
+
+/// Where in a press an event is.
+enum Stage {
+    Down,
+    Dragged,
+    Up,
+}
+
+fn press_stage(kind: u64) -> Option<(Button, Stage)> {
+    Some(match kind {
+        kind::LEFT_MOUSE_DOWN => (Button::Left, Stage::Down),
+        kind::LEFT_MOUSE_DRAGGED => (Button::Left, Stage::Dragged),
+        kind::LEFT_MOUSE_UP => (Button::Left, Stage::Up),
+        kind::RIGHT_MOUSE_DOWN => (Button::Right, Stage::Down),
+        kind::RIGHT_MOUSE_DRAGGED => (Button::Right, Stage::Dragged),
+        kind::RIGHT_MOUSE_UP => (Button::Right, Stage::Up),
+        kind::OTHER_MOUSE_DOWN => (Button::Other, Stage::Down),
+        kind::OTHER_MOUSE_DRAGGED => (Button::Other, Stage::Dragged),
+        kind::OTHER_MOUSE_UP => (Button::Other, Stage::Up),
+        _ => return None,
+    })
+}
+
+thread_local! {
+    static PRESSES: std::cell::Cell<[Option<Press>; 3]> =
+        const { std::cell::Cell::new([None; 3]) };
+}
+
+/// Swap the press of `button` for `press`, returning the one it had.
+fn replace_press(button: Button, press: Option<Press>) -> Option<Press> {
+    let mut presses = PRESSES.get();
+    let old = std::mem::replace(&mut presses[button as usize], press);
+    PRESSES.set(presses);
+    old
+}
+
+/// Where a positional event goes, and the press it ends, whose view is kept
+/// alive until the event has been delivered.
+struct Target {
+    view: Id,
+    ended: Option<Id>,
+}
+
+impl Target {
+    fn to(view: Id) -> Self {
+        Self { view, ended: None }
+    }
+}
+
+impl Drop for Target {
+    fn drop(&mut self) {
+        if let Some(view) = self.ended {
+            objc::arc::release(view);
+        }
+    }
+}
+
+/// Which view a positional event of `kind` goes to, given the one under it.
+///
+/// AppKit sends the drags and the release of a press to the view that took the
+/// press, wherever the pointer goes. An event routed through another window
+/// is located in that window, so it goes to the view under it there instead.
+fn pressed_view(window: Id, kind: u64, under_pointer: Id) -> Target {
+    let Some((button, stage)) = press_stage(kind) else {
+        return Target::to(under_pointer);
+    };
+    let in_window = |press: Press| match press.window == window {
+        true => press.view,
+        false => under_pointer,
+    };
+    match stage {
+        Stage::Down => {
+            let view = objc::arc::retain(under_pointer);
+            // A release a guest's own tracking loop took never reached here.
+            if let Some(stale) = replace_press(button, Some(Press { window, view })) {
+                objc::arc::release(stale.view);
+            }
+            Target::to(under_pointer)
+        }
+        Stage::Dragged => {
+            Target::to(PRESSES.get()[button as usize].map_or(under_pointer, in_window))
+        }
+        Stage::Up => match replace_press(button, None) {
+            Some(press) => Target {
+                view: in_window(press),
+                ended: Some(press.view),
+            },
+            None => Target::to(under_pointer),
+        },
+    }
+}
+
 pub fn route(window: Id, event: Id) {
     let kind = nsevent::kind_of(event);
     log_route(window, event, kind);
@@ -1181,13 +1333,14 @@ pub fn route(window: Id, event: Id) {
         }
         return;
     }
-    let start = match positional(kind) {
+    let target = match positional(kind) {
         // SAFETY: null or the content view, which this crate made.
-        true => unsafe {
+        true => pressed_view(window, kind, unsafe {
             crate::view::hit_test(window::content_view_of(window), nsevent::location_of(event))
-        },
-        false => responder_of(window),
+        }),
+        false => Target::to(responder_of(window)),
     };
+    let start = target.view;
     if kind == kind::LEFT_MOUSE_DOWN {
         focus_clicked(window, start);
     }
@@ -1334,6 +1487,7 @@ fn responder_selector(kind: u64) -> Option<&'static str> {
         kind::MOUSE_EXITED => "mouseExited:",
         kind::CURSOR_UPDATE => "cursorUpdate:",
         kind::SCROLL_WHEEL => "scrollWheel:",
+        kind::MAGNIFY => "magnifyWithEvent:",
         kind::KEY_DOWN => "keyDown:",
         kind::KEY_UP => "keyUp:",
         kind::FLAGS_CHANGED => "flagsChanged:",
@@ -1599,7 +1753,7 @@ fn post(id: u32, name: &str) {
 /// without resigning in between.
 static ANNOUNCED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn answers(object: Id, selector: &str) -> bool {
+pub(crate) fn answers(object: Id, selector: &str) -> bool {
     // SAFETY: a window this crate made; both selectors are `BOOL (id, SEL)`,
     // sent so a subclass's override decides.
     unsafe {
@@ -1732,6 +1886,285 @@ fn delegate_selector(name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_press_keeps_its_drags_and_release_wherever_the_pointer_goes() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSView").expect("NSView");
+        let pressed = objc::object::create_instance(class, 0);
+        let other = objc::object::create_instance(class, 0);
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+
+        assert_eq!(
+            pressed_view(window, kind::LEFT_MOUSE_DOWN, pressed).view,
+            pressed
+        );
+        assert_eq!(
+            pressed_view(window, kind::LEFT_MOUSE_DRAGGED, other).view,
+            pressed
+        );
+        assert_eq!(
+            pressed_view(window, kind::LEFT_MOUSE_UP, other).view,
+            pressed
+        );
+
+        assert_eq!(
+            pressed_view(window, kind::LEFT_MOUSE_DRAGGED, other).view,
+            other
+        );
+        assert_eq!(pressed_view(window, kind::LEFT_MOUSE_UP, other).view, other);
+    }
+
+    #[test]
+    fn a_press_does_not_follow_the_pointer_into_another_window() {
+        crate::bootstrap();
+        let view_class = objc::class::lookup(c"NSView").expect("NSView");
+        let window_class = objc::class::lookup(c"NSWindow").expect("NSWindow");
+        let pressed = objc::object::create_instance(view_class, 0);
+        let other = objc::object::create_instance(view_class, 0);
+        let first = objc::object::create_instance(window_class, 0);
+        let second = objc::object::create_instance(window_class, 0);
+
+        pressed_view(first, kind::LEFT_MOUSE_DOWN, pressed);
+        assert_eq!(
+            pressed_view(second, kind::LEFT_MOUSE_DRAGGED, other).view,
+            other
+        );
+        assert_eq!(
+            pressed_view(first, kind::LEFT_MOUSE_DRAGGED, other).view,
+            pressed
+        );
+        assert_eq!(pressed_view(second, kind::LEFT_MOUSE_UP, other).view, other);
+        assert_eq!(
+            pressed_view(first, kind::LEFT_MOUSE_DRAGGED, other).view,
+            other
+        );
+    }
+
+    #[test]
+    fn each_button_keeps_its_own_pressed_view() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSView").expect("NSView");
+        let left = objc::object::create_instance(class, 0);
+        let right = objc::object::create_instance(class, 0);
+        let other = objc::object::create_instance(class, 0);
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+
+        pressed_view(window, kind::LEFT_MOUSE_DOWN, left);
+        pressed_view(window, kind::RIGHT_MOUSE_DOWN, right);
+        assert_eq!(
+            pressed_view(window, kind::OTHER_MOUSE_DRAGGED, other).view,
+            other
+        );
+        assert_eq!(
+            pressed_view(window, kind::RIGHT_MOUSE_DRAGGED, other).view,
+            right
+        );
+        assert_eq!(
+            pressed_view(window, kind::LEFT_MOUSE_DRAGGED, other).view,
+            left
+        );
+        assert_eq!(
+            pressed_view(window, kind::RIGHT_MOUSE_UP, other).view,
+            right
+        );
+        assert_eq!(pressed_view(window, kind::LEFT_MOUSE_UP, other).view, left);
+    }
+
+    #[test]
+    fn route_sends_a_press_and_its_release_to_the_pressed_view() {
+        if !sdl3::isolated::run_here_with_dummy_video() {
+            return;
+        }
+        use foundation::geometry::{NSRect, NSSize};
+        use objc::sel::Sel;
+        static SEEN: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
+
+        unsafe extern "C" fn record(receiver: Id, _sel: Sel, event: Id) {
+            SEEN.lock()
+                .unwrap()
+                .push((receiver as usize, nsevent::kind_of(event)));
+        }
+
+        crate::bootstrap();
+        let size = NSSize {
+            width: 200.0,
+            height: 100.0,
+        };
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        // SAFETY: a fresh window, backed by SDL's dummy video driver.
+        assert!(unsafe {
+            window::init_with_content_rect_for_tests(
+                window,
+                NSRect {
+                    origin: NSPoint::default(),
+                    size,
+                },
+            )
+        });
+        let class = objc::class::allocate_pair(objc::class::lookup(c"NSView"), c"PressRecorder", 0)
+            .unwrap();
+        for selector in ["mouseDown:", "mouseDragged:", "mouseUp:"] {
+            class.add_method(
+                objc::sel::get(selector),
+                record as objc::class::Imp,
+                c"v24@0:8@16",
+            );
+        }
+        objc::class::register_pair(class);
+        let half = NSSize {
+            width: size.width / 2.0,
+            ..size
+        };
+        let left = objc::object::create_instance(class, 0);
+        let right = objc::object::create_instance(class, 0);
+        // SAFETY: views this test allocated and NSView's declared signatures.
+        unsafe {
+            let add: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+            for (view, x) in [(left, 0.0), (right, half.width)] {
+                let frame = NSRect {
+                    origin: NSPoint { x, y: 0.0 },
+                    size: half,
+                };
+                crate::view::init_with_frame(view, objc::sel::get("initWithFrame:"), frame);
+                add(
+                    window::content_view_of(window),
+                    objc::sel::get("addSubview:"),
+                    view,
+                );
+            }
+        }
+        let over_left = NSPoint { x: 50.0, y: 50.0 };
+        let over_right = NSPoint { x: 150.0, y: 50.0 };
+        for (kind, location) in [
+            (kind::LEFT_MOUSE_DOWN, over_left),
+            (kind::LEFT_MOUSE_DRAGGED, over_right),
+            (kind::LEFT_MOUSE_UP, over_right),
+            (kind::LEFT_MOUSE_DOWN, over_right),
+        ] {
+            let event = nsevent::make(Fields {
+                kind,
+                location,
+                window,
+                ..Default::default()
+            });
+            route(window, event);
+        }
+        assert_eq!(
+            *SEEN.lock().unwrap(),
+            [
+                (left as usize, kind::LEFT_MOUSE_DOWN),
+                (left as usize, kind::LEFT_MOUSE_DRAGGED),
+                (left as usize, kind::LEFT_MOUSE_UP),
+                (right as usize, kind::LEFT_MOUSE_DOWN),
+            ]
+        );
+        objc::arc::release(left);
+        objc::arc::release(right);
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn pinch_gestures_reach_the_view_under_the_pointer_with_magnification_and_phases() {
+        if !sdl3::isolated::run_here_with_dummy_video() {
+            return;
+        }
+        use foundation::geometry::{NSRect, NSSize};
+        use objc::sel::Sel;
+        use sdl3::video::{Event, PinchPhase};
+        static SEEN: std::sync::Mutex<Vec<(usize, u64, f64)>> = std::sync::Mutex::new(Vec::new());
+
+        unsafe extern "C" fn record(receiver: Id, _sel: Sel, event: Id) {
+            assert_eq!(nsevent::kind_of(event), kind::MAGNIFY);
+            // SAFETY: NSEvent's declared phase and magnification signatures.
+            let (phase, magnification) = unsafe {
+                let phase: unsafe extern "C" fn(Id, Sel) -> u64 =
+                    std::mem::transmute(objc::msg::entry());
+                let magnification: unsafe extern "C" fn(Id, Sel) -> f64 =
+                    std::mem::transmute(objc::msg::entry());
+                (
+                    phase(event, objc::sel::get("phase")),
+                    magnification(event, objc::sel::get("magnification")),
+                )
+            };
+            SEEN.lock()
+                .unwrap()
+                .push((receiver as usize, phase, magnification));
+        }
+
+        crate::bootstrap();
+        let object = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        let rect = NSRect {
+            origin: NSPoint::default(),
+            size: NSSize {
+                width: 200.0,
+                height: 150.0,
+            },
+        };
+        // SAFETY: a fresh window, backed by SDL's dummy video driver.
+        assert!(unsafe { window::init_with_content_rect_for_tests(object, rect) });
+        let class = objc::class::allocate_pair(objc::class::lookup(c"NSView"), c"PinchRecorder", 0)
+            .unwrap();
+        class.add_method(
+            objc::sel::get("magnifyWithEvent:"),
+            record as objc::class::Imp,
+            c"v24@0:8@16",
+        );
+        objc::class::register_pair(class);
+        let parent = objc::object::create_instance(class, 0);
+        let child = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        // SAFETY: views this test allocated and NSView's declared signatures.
+        unsafe {
+            crate::view::init_with_frame(parent, objc::sel::get("initWithFrame:"), rect);
+            crate::view::init_with_frame(child, objc::sel::get("initWithFrame:"), rect);
+            let add: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+            add(
+                window::content_view_of(object),
+                objc::sel::get("addSubview:"),
+                parent,
+            );
+            add(parent, objc::sel::get("addSubview:"), child);
+        }
+        // SAFETY: the SDL window belongs to the window made above.
+        let id = sdl3::video::window_id(unsafe { window::sdl_window(object) });
+        track_pointer(id, 40.0, 40.0 + window::content_inset(object) as f32);
+        for (phase, scale) in [
+            (PinchPhase::Began, 0.0),
+            (PinchPhase::Changed, 1.25),
+            (PinchPhase::Changed, 0.75),
+        ] {
+            deliver(Event::Pinch {
+                window: id,
+                scale,
+                phase,
+            });
+        }
+        for scale in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            deliver(Event::Pinch {
+                window: id,
+                scale,
+                phase: PinchPhase::Changed,
+            });
+        }
+        // A windowless host event uses the pointer's window, too.
+        deliver(Event::Pinch {
+            window: 0,
+            scale: 0.0,
+            phase: PinchPhase::Ended,
+        });
+        assert_eq!(
+            *SEEN.lock().unwrap(),
+            [
+                (parent as usize, nsevent::phase::BEGAN, 0.0),
+                (parent as usize, nsevent::phase::CHANGED, 0.25),
+                (parent as usize, nsevent::phase::CHANGED, -0.25),
+                (parent as usize, nsevent::phase::ENDED, 0.0),
+            ]
+        );
+        objc::arc::release(child);
+        objc::arc::release(parent);
+        objc::arc::release(object);
+    }
 
     #[test]
     fn only_printable_characters_are_typed_without_the_input_method() {

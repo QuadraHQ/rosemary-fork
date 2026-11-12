@@ -2,24 +2,30 @@ mod bind;
 mod blit;
 mod command_buffer;
 mod compute;
+mod depth_bias;
+mod hazards;
 mod parallel;
 mod pass;
 mod queue;
 mod render;
 mod retire;
 mod state;
+mod target;
 mod visibility;
 
 use bind::*;
 use blit::*;
 use command_buffer::*;
 use compute::*;
+use depth_bias::*;
+use hazards::*;
 use parallel::*;
 use pass::*;
 use queue::*;
 use render::*;
 use retire::*;
 use state::*;
+use target::*;
 use visibility::*;
 
 use objc::address::AddressSet;
@@ -32,6 +38,7 @@ use ash::vk;
 use metal_translate::ir::{ResourceKind, Stage};
 use objc::object::Id;
 use objc::sel::Sel;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::gpu::{
@@ -39,11 +46,15 @@ use crate::gpu::{
 };
 use crate::object::{self, methods};
 use crate::pipeline::{
-    BUFFER_SET, ComputePipeline, DepthStencilKey, Layouts, RenderPipeline, RenderVariantKey, SETS,
-    binding_type,
+    BUFFER_SET, ComputePipeline, DepthStencilKey, Layouts, RenderDynamicState, RenderPipeline,
+    RenderVariantKey, SETS, binding_type,
 };
 use crate::resource::{Buffer, DepthStencilState, SamplerState, Texture};
 use crate::stats::{self, Counter};
+
+#[cfg(test)]
+pub(crate) static TEST_RECORDED_BARRIERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Metal's per-stage binding tables. Index by `Stage::ordinal`.
 const STAGES: usize = 3;
@@ -63,6 +74,9 @@ struct BufferBinding {
     /// Whether `buffer` is an upload chunk `-setBytes:` copied into, whose
     /// offset can be a dynamic one.
     uploaded: bool,
+    /// The `MTLBuffer` bound, which the command buffer has retained, or null
+    /// for `-setBytes:` copies.
+    object: Id,
 }
 
 impl Default for BufferBinding {
@@ -73,6 +87,7 @@ impl Default for BufferBinding {
             end: 0,
             range: vk::WHOLE_SIZE,
             uploaded: false,
+            object: std::ptr::null_mut(),
         }
     }
 }
@@ -111,6 +126,90 @@ impl PartialEq for DescriptorEntry {
 
 impl Eq for DescriptorEntry {}
 
+/// The descriptor sets a command buffer has written, in two flat lists so
+/// that remembering one allocates nothing once they have grown.
+#[derive(Default)]
+struct WrittenSets {
+    /// The newest set with each contents hash; older ones are chained.
+    newest: crate::hash::FastMap<u64, u32>,
+    sets: Vec<WrittenSet>,
+    entries: Vec<DescriptorEntry>,
+}
+
+struct WrittenSet {
+    layout: vk::DescriptorSetLayout,
+    set: vk::DescriptorSet,
+    /// Its entries, as a range of [`WrittenSets::entries`].
+    start: u32,
+    len: u32,
+    /// The set written before it with the same hash, or [`NO_SET`].
+    older: u32,
+}
+
+const NO_SET: u32 = u32::MAX;
+
+impl WrittenSets {
+    fn find(
+        &self,
+        layout: vk::DescriptorSetLayout,
+        entries: &[DescriptorEntry],
+    ) -> Option<vk::DescriptorSet> {
+        let mut at = *self.newest.get(&contents_key(layout, entries))?;
+        while at != NO_SET {
+            let written = &self.sets[at as usize];
+            let range = written.start as usize..(written.start + written.len) as usize;
+            if written.layout == layout && self.entries[range] == *entries {
+                return Some(written.set);
+            }
+            at = written.older;
+        }
+        None
+    }
+
+    fn remember(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+        entries: &[DescriptorEntry],
+        set: vk::DescriptorSet,
+    ) {
+        let at = self.sets.len() as u32;
+        let older = self
+            .newest
+            .insert(contents_key(layout, entries), at)
+            .unwrap_or(NO_SET);
+        self.sets.push(WrittenSet {
+            layout,
+            set,
+            start: self.entries.len() as u32,
+            len: entries.len() as u32,
+            older,
+        });
+        self.entries.extend_from_slice(entries);
+    }
+
+    fn clear(&mut self) {
+        self.newest.clear();
+        self.sets.clear();
+        self.entries.clear();
+    }
+}
+
+/// A hash of what [`DescriptorEntry`]'s equality compares, under `layout`.
+fn contents_key(layout: vk::DescriptorSetLayout, entries: &[DescriptorEntry]) -> u64 {
+    use std::hash::Hasher;
+    use vk::Handle;
+    let mut hasher = crate::hash::FastHasher::default();
+    hasher.write_u64(layout.as_raw());
+    for entry in entries {
+        hasher.write_u32(entry.binding);
+        hasher.write_i32(entry.kind.as_raw());
+        hasher.write_u64(entry.handle);
+        hasher.write_u64(entry.offset);
+        hasher.write_u64(entry.range);
+    }
+    hasher.finish()
+}
+
 /// The descriptor set last written for one set index, reused while the
 /// resources a draw needs are the ones it already holds.
 #[derive(Default)]
@@ -119,6 +218,10 @@ struct SetCache {
     set: vk::DescriptorSet,
     entries: Vec<DescriptorEntry>,
 }
+
+/// The least an upload is aligned to, whatever the device asks, so that a
+/// 64-bit query result or a `float4` lands at its natural alignment.
+const UPLOAD_ALIGNMENT: u64 = 16;
 
 /// What is bound at one bind point, so that a draw which changes nothing
 /// records nothing.
@@ -151,6 +254,10 @@ pub(crate) struct CommandBuffer {
     /// Event values the batch now recording waits for.
     waits: Vec<(vk::Semaphore, u64)>,
     descriptor_pools: Vec<vk::DescriptorPool>,
+    /// The sets written from those pools, by layout and contents. A set is
+    /// never written again once a draw has used it, so a draw which needs the
+    /// same descriptors binds it rather than allocating and writing another.
+    written_sets: WrittenSets,
     /// Objects the recording refers to, retained until the work completes.
     /// Each is retained once however often it is bound: a retain is a global
     /// lock in the Objective-C runtime, and a frame binds the same objects
@@ -161,6 +268,10 @@ pub(crate) struct CommandBuffer {
     /// one the copies have reached.
     uploads: Vec<GpuBuffer>,
     upload_used: u64,
+    /// Blit sources read from host pages at commit; see [`Self::copy_source`].
+    snapshots: Vec<Snapshot>,
+    /// Upload memory for snapshots too large for an upload chunk.
+    staging: Vec<GpuBuffer>,
     framebuffers: Vec<vk::Framebuffer>,
     /// Sub-encoders' secondary command buffers this one executes.
     secondaries: Vec<gpu::SecondaryContext>,
@@ -181,6 +292,9 @@ pub(crate) struct CommandBuffer {
     /// `ROSEMARY_METAL_PROFILE`: shared with its parallel sub-encoders.
     profile: Option<Arc<crate::profile::Profile>>,
     occlusion: Occlusion,
+    /// What render passes since the last full barrier touched, which later
+    /// work waits for only where it conflicts.
+    hazards: Hazards,
 }
 
 pub(crate) struct Encoder {
@@ -189,6 +303,8 @@ pub(crate) struct Encoder {
     /// `MTLDispatchTypeConcurrent`: dispatches may overlap, and the guest
     /// orders them with memory barriers. Every other compute encoder is serial.
     concurrent: bool,
+    /// Whether a full memory barrier follows everything this encoder recorded.
+    barrier_is_last: std::cell::Cell<bool>,
     compute_pipeline: Id,
     render_pipeline: Id,
     depth_state: Id,
@@ -200,13 +316,18 @@ pub(crate) struct Encoder {
     winding: u64,
     fill_mode: u64,
     depth_clip: u64,
+    depth_bias: RecordedDepthBias,
     in_render_pass: bool,
+    /// A render pass whose Vulkan pass begins at its first draw and is
+    /// ordered against earlier passes by what it touches; `None` for every
+    /// other encoder, which is ordered by full barriers.
+    lazy: Option<LazyPass>,
     /// Whether this is a parallel render sub-encoder, which records into a
     /// secondary command buffer inside a pass its parallel encoder began.
     sub_encoder: bool,
-    /// The render pass, framebuffer and area of the pass a parallel encoder
-    /// began, which its sub-encoders' command buffers inherit.
-    inheritance: Option<(vk::RenderPass, vk::Framebuffer, vk::Rect2D)>,
+    /// The pass a parallel encoder began and its area, which its
+    /// sub-encoders' command buffers inherit.
+    inheritance: Option<(Inheritance, vk::Rect2D)>,
     /// Which colour attachments of the pass being recorded are resolved, for
     /// the pipeline variant a draw needs. See [`RenderVariantKey`].
     resolve_mask: u32,
@@ -224,10 +345,22 @@ pub(crate) struct Encoder {
     visibility: Option<VisibilityTarget>,
     /// The pipeline variant the last draw or dispatch used, with the state
     /// which chose it, so a run of draws with one state asks no cache.
-    render_variant: Option<(Id, RenderVariantKey, vk::Pipeline)>,
+    render_variant: Option<(Id, RenderVariantKey, vk::Pipeline, RenderDynamicState)>,
+    /// The per-draw state this encoder last recorded, where the device sets
+    /// it per draw; `None` until the first draw, as nothing is inherited.
+    render_dynamic: Option<RenderDynamicState>,
     compute_variant: Option<(Id, [u32; 3], vk::Pipeline)>,
+    /// A render encoder's attachment images, all of them written.
+    attachments: Vec<(vk::Image, vk::ImageAspectFlags)>,
+    /// Whether this encoder may write anything but its attachments: a
+    /// resource a shader writes, a resolve copy, query results, an attachment
+    /// whose memory another resource can share. It then waits for every
+    /// earlier pass and ends with a barrier over all memory.
+    writes_elsewhere: bool,
     /// Index by `bind_point_slot`.
     bound: [BindPoint; 2],
+    /// Per set index, the last set bound or pushed there; the push path
+    /// reads it to know whether the bind point still holds its push.
     set_cache: [SetCache; SETS],
     /// Scratch for the entries a draw needs, kept to avoid an allocation.
     wanted: [Vec<DescriptorEntry>; SETS],
@@ -303,6 +436,24 @@ impl CommandBuffer {
         }
     }
 
+    /// A set this command buffer already wrote with exactly `entries`.
+    fn written_set(
+        &self,
+        layout: vk::DescriptorSetLayout,
+        entries: &[DescriptorEntry],
+    ) -> Option<vk::DescriptorSet> {
+        self.written_sets.find(layout, entries)
+    }
+
+    fn remember_set(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+        entries: &[DescriptorEntry],
+        set: vk::DescriptorSet,
+    ) {
+        self.written_sets.remember(layout, entries, set);
+    }
+
     /// A descriptor set for `layout`, from a pool this command buffer owns.
     pub(super) fn allocate_set(
         &mut self,
@@ -342,12 +493,22 @@ impl CommandBuffer {
     /// Copy `bytes` into this command buffer's upload chunks, answering the
     /// buffer and offset they landed at. The copy lives until the work does.
     pub(super) fn upload(&mut self, bytes: &[u8]) -> Option<(vk::Buffer, u64)> {
-        let length = bytes.len() as u64;
-        let limits = &self.gpu.limits;
-        let alignment = limits
+        let (buffer, offset, contents) = self.reserve(bytes.len() as u64)?;
+        // SAFETY: `reserve` handed out these `bytes.len()` mapped bytes once.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents, bytes.len()) };
+        Some((buffer, offset))
+    }
+
+    /// Set aside `length` bytes of the upload chunks for the device to write,
+    /// answering where they are and the mapping of their first byte.
+    pub(super) fn reserve(&mut self, length: u64) -> Option<(vk::Buffer, u64, *mut u8)> {
+        // Every upload is read through a storage descriptor, a vertex or
+        // index binding, or a copy; none is a uniform buffer.
+        let alignment = self
+            .gpu
+            .limits
             .min_storage_buffer_offset_alignment
-            .max(limits.min_uniform_buffer_offset_alignment)
-            .max(16);
+            .max(UPLOAD_ALIGNMENT);
         let offset = self.upload_used.next_multiple_of(alignment);
         let offset = match self.uploads.last() {
             Some(_) if offset + length <= gpu::UPLOAD_CHUNK => offset,
@@ -363,18 +524,81 @@ impl CommandBuffer {
             }
         };
         let chunk = self.uploads.last().expect("a chunk was just ensured");
-        // SAFETY: the chunk is mapped over `UPLOAD_CHUNK` bytes, and this range
-        // is inside it and handed out once.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                chunk.contents.add(offset as usize),
-                bytes.len(),
-            )
-        };
         self.upload_used = offset + length;
-        Some((chunk.buffer, offset))
+        // SAFETY: the chunk is mapped over `UPLOAD_CHUNK` bytes, and this
+        // offset is inside it.
+        Some((chunk.buffer, offset, unsafe {
+            chunk.contents.add(offset as usize)
+        }))
     }
+
+    /// The buffer and offset a blit reads `offset..offset + length` of
+    /// `source` through. The caller has checked the range is inside.
+    ///
+    /// Host pages the device has never been given cannot have been written by
+    /// it, so their bytes at commit are what the copy would read, and Metal
+    /// requires the CPU's writes be done by then. Those are copied into upload
+    /// memory at commit instead of being imported. Behind an event wait the
+    /// CPU may still write after commit, so the pages are imported as before.
+    pub(super) fn copy_source(
+        &mut self,
+        source: Id,
+        offset: u64,
+        length: u64,
+    ) -> (vk::Buffer, u64) {
+        // SAFETY: only buffers of this crate's reach a blit encoder.
+        let body = unsafe { object::body::<Buffer>(source) };
+        let snapshot = body.host_pages().is_some_and(|pages| !pages.imported())
+            && !self.waits_for_event()
+            && self.gpu.event_waits_in_flight.load(Ordering::Acquire) == 0;
+        if snapshot && let Some((buffer, at, target)) = self.reserve_snapshot(length) {
+            self.snapshots.push(Snapshot {
+                source,
+                offset,
+                length,
+                target,
+                buffer,
+                at,
+            });
+            stats::count(Counter::CopySnapshots);
+            return (buffer, at);
+        }
+        body.device_range(offset, length)
+    }
+
+    fn reserve_snapshot(&mut self, length: u64) -> Option<(vk::Buffer, u64, *mut u8)> {
+        if length <= gpu::UPLOAD_CHUNK {
+            return self.reserve(length);
+        }
+        match self.gpu.create_staging_buffer(length) {
+            Ok(staging) => {
+                let found = (staging.buffer, 0, staging.contents);
+                self.staging.push(staging);
+                Some(found)
+            }
+            Err(reason) => {
+                gpu::trace(format!("blit snapshot staging failed: {reason}"));
+                None
+            }
+        }
+    }
+
+    /// Whether any batch recorded so far, or the one recording, waits for an
+    /// event.
+    fn waits_for_event(&self) -> bool {
+        !self.waits.is_empty() || self.batches.iter().any(|batch| !batch.waits.is_empty())
+    }
+}
+
+/// Bytes a blit reads from host pages, copied into upload memory at commit.
+struct Snapshot {
+    /// The `MTLBuffer`, retained by the command buffer with the copy.
+    source: Id,
+    offset: u64,
+    length: u64,
+    target: *mut u8,
+    buffer: vk::Buffer,
+    at: u64,
 }
 
 impl Encoder {}
@@ -388,31 +612,12 @@ impl Encoder {}
 
 impl Encoder {}
 
-impl Default for AttachmentDescriptor {
-    fn default() -> Self {
-        Self {
-            texture: std::ptr::null_mut(),
-            level: 0,
-            slice: 0,
-            load_action: 0,
-            store_action: 0,
-            clear_color: [0.0; 4],
-            clear_depth: 1.0,
-            clear_stencil: 0,
-            resolve_texture: std::ptr::null_mut(),
-            resolve_level: 0,
-            resolve_slice: 0,
-            resolve_filter: 0,
-        }
-    }
-}
-
 impl Default for RenderPassDescriptor {
     fn default() -> Self {
         Self {
-            colors: [AttachmentDescriptor::default(); RENDER_TARGETS],
-            depth: AttachmentDescriptor::default(),
-            stencil: AttachmentDescriptor::default(),
+            colors: [AttachmentSlot::Color(0).defaults(); RENDER_TARGETS],
+            depth: AttachmentSlot::Depth.defaults(),
+            stencil: AttachmentSlot::Stencil.defaults(),
             color_objects: std::ptr::null_mut(),
             depth_object: std::ptr::null_mut(),
             stencil_object: std::ptr::null_mut(),
@@ -576,17 +781,17 @@ pub(crate) fn install() {
         "setColorStoreAction:atIndex:" => crate::no_op, c"v32@0:8Q16Q24";
         "setDepthStoreAction:" => crate::no_op, c"v24@0:8Q16";
         "setStencilStoreAction:" => crate::no_op, c"v24@0:8Q16";
-        // One Vulkan queue runs every encoder in order behind a full barrier,
-        // which is everything a fence could ask for.
+        // A pass which updates a fence is ordered against later passes by
+        // what it writes; one which waits for a fence waits for them all.
         "updateFence:afterStages:" => crate::no_op, c"v32@0:8@16Q24";
-        "waitForFence:beforeStages:" => crate::no_op, c"v32@0:8@16Q24";
+        "waitForFence:beforeStages:" => order_after_earlier_passes, c"v32@0:8@16Q24";
         "memoryBarrierWithScope:" => memory_barrier, c"v24@0:8Q16";
         "memoryBarrierWithScope:afterStages:beforeStages:" => memory_barrier, c"v40@0:8Q16Q24Q32";
         "memoryBarrierWithResources:count:" => memory_barrier, c"v32@0:8^@16Q24";
         "memoryBarrierWithResources:count:afterStages:beforeStages:" => memory_barrier,
             c"v48@0:8^@16Q24Q32Q40";
-        "useResource:usage:stages:" => crate::no_op, c"v40@0:8@16Q24Q32";
-        "useHeap:" => crate::no_op, c"v24@0:8@16";
+        "useResource:usage:stages:" => order_after_earlier_passes, c"v40@0:8@16Q24Q32";
+        "useHeap:" => order_after_earlier_passes, c"v24@0:8@16";
         "setStencilFrontReferenceValue:backReferenceValue:" => set_stencil_references,
             c"v24@0:8I16I20";
         "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:"
@@ -601,12 +806,12 @@ pub(crate) fn install() {
         "optimizeContentsForCPUAccess:" => crate::no_op, c"v24@0:8@16";
         "optimizeContentsForCPUAccess:slice:level:" => crate::no_op, c"v40@0:8@16Q24Q32";
         "updateFence:" => crate::no_op, c"v24@0:8@16";
-        "waitForFence:" => crate::no_op, c"v24@0:8@16";
+        "waitForFence:" => order_after_earlier_passes, c"v24@0:8@16";
         "pushDebugGroup:" => crate::no_op, c"v24@0:8@16";
         "popDebugGroup" => crate::no_op, c"v16@0:8";
         "insertDebugSignpost:" => crate::no_op, c"v24@0:8@16";
         "setLabel:" => crate::no_op, c"v24@0:8@16";
-        "useResource:usage:" => crate::no_op, c"v32@0:8@16Q24";
+        "useResource:usage:" => order_after_earlier_passes, c"v32@0:8@16Q24";
         "setVisibilityResultMode:offset:" => set_visibility_result_mode, c"v32@0:8Q16Q24";
     });
 
@@ -786,16 +991,80 @@ pub(crate) fn install() {
     for (selector, implementation, types) in per_stage.into_iter().chain(ranged) {
         encoder.replace_method(objc::sel::get(selector), implementation, types);
     }
-    for selector in [
-        "setCullMode:",
-        "setFrontFacingWinding:",
-        "setTriangleFillMode:",
-        "setDepthClipMode:",
-    ] {
+    let raster: [(&str, unsafe extern "C" fn(Id, Sel, u64)); 4] = [
+        ("setCullMode:", set_cull_mode),
+        ("setFrontFacingWinding:", set_front_facing_winding),
+        ("setTriangleFillMode:", set_triangle_fill_mode),
+        ("setDepthClipMode:", set_depth_clip_mode),
+    ];
+    for (selector, implementation) in raster {
         encoder.replace_method(
             objc::sel::get(selector),
-            set_raster_value as *const std::ffi::c_void,
+            implementation as *const std::ffi::c_void,
             c"v24@0:8Q16",
         );
+    }
+}
+
+#[cfg(test)]
+mod written_sets_tests {
+    use super::*;
+    use vk::Handle;
+
+    fn entries(handle: u64) -> Vec<DescriptorEntry> {
+        vec![DescriptorEntry {
+            binding: 0,
+            kind: vk::DescriptorType::STORAGE_BUFFER,
+            handle,
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+            dynamic_offset: 0,
+        }]
+    }
+
+    fn layout(raw: u64) -> vk::DescriptorSetLayout {
+        vk::DescriptorSetLayout::from_raw(raw)
+    }
+
+    fn set(raw: u64) -> vk::DescriptorSet {
+        vk::DescriptorSet::from_raw(raw)
+    }
+
+    #[test]
+    fn finds_any_remembered_set_with_the_same_layout_and_entries() {
+        let mut written = WrittenSets::default();
+        written.remember(layout(1), &entries(100), set(10));
+        written.remember(layout(1), &entries(200), set(20));
+        assert_eq!(written.find(layout(1), &entries(100)), Some(set(10)));
+        assert_eq!(written.find(layout(1), &entries(200)), Some(set(20)));
+        assert_eq!(written.find(layout(2), &entries(100)), None);
+        assert_eq!(written.find(layout(1), &entries(300)), None);
+    }
+
+    #[test]
+    fn ignores_dynamic_offsets_when_matching() {
+        let mut written = WrittenSets::default();
+        written.remember(layout(1), &entries(100), set(10));
+        let mut moved = entries(100);
+        moved[0].dynamic_offset = 256;
+        assert_eq!(written.find(layout(1), &moved), Some(set(10)));
+    }
+
+    #[test]
+    fn remembers_every_set_a_frame_writes() {
+        let mut written = WrittenSets::default();
+        for index in 0..64 {
+            written.remember(layout(1), &entries(index), set(index + 1));
+        }
+        assert_eq!(written.find(layout(1), &entries(0)), Some(set(1)));
+        assert_eq!(written.find(layout(1), &entries(63)), Some(set(64)));
+    }
+
+    #[test]
+    fn forgets_everything_when_cleared() {
+        let mut written = WrittenSets::default();
+        written.remember(layout(1), &entries(100), set(10));
+        written.clear();
+        assert_eq!(written.find(layout(1), &entries(100)), None);
     }
 }

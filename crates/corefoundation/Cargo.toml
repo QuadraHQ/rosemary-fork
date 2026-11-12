@@ -13,7 +13,11 @@ objc.workspace = true
 prefix.workspace = true
 libc.workspace = true
 getrandom.workspace = true
+hashbrown.workspace = true
 static_init.workspace = true
 sdl3.workspace = true
 icu_normalizer.workspace = true
 icu_properties.workspace = true
+
+[lints]
+workspace = true

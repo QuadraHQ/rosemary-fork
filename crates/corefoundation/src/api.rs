@@ -18,11 +18,36 @@ pub type Boolean = u8;
 /// identities, but not arbitrary custom allocation callbacks.
 pub type CFAllocatorRef = *const c_void;
 
+/// `CFAllocatorDeallocateCallBack`: `void (*)(void *ptr, void *info)`.
+pub type CFAllocatorDeallocateCallBack = unsafe extern "C" fn(*mut c_void, *mut c_void);
+
+/// `CFAllocatorContext`. Only `info` and `deallocate` are read; the other
+/// callbacks are listed for the layout.
+#[repr(C)]
+pub struct CFAllocatorContext {
+    pub version: CFIndex,
+    pub info: *mut c_void,
+    pub retain: *const c_void,
+    pub release: *const c_void,
+    pub copy_description: *const c_void,
+    pub allocate: *const c_void,
+    pub reallocate: *const c_void,
+    pub deallocate: Option<CFAllocatorDeallocateCallBack>,
+    pub preferred_size: *const c_void,
+}
+
+/// An allocator object: what a custom allocator's context leaves behind.
+#[repr(C)]
+struct AllocatorBody {
+    isa: *const objc::class::Class,
+    info: *mut c_void,
+    deallocate: Option<CFAllocatorDeallocateCallBack>,
+}
+
 /// `kCFAllocatorDefault` is a NULL sentinel; `CFAllocatorGetDefault()` instead
-/// returns the non-null system-default singleton. Custom allocators retain
-/// their own identity, but this CoreFoundation does not invoke their callbacks.
+/// returns the non-null system-default singleton.
 fn allocator_class() -> &'static objc::class::Class {
-    crate::base::register(c"__NSCFAllocator", None, std::mem::size_of::<usize>(), true)
+    crate::base::register(c"__NSCFAllocator", None, size_of::<AllocatorBody>(), true)
 }
 
 pub unsafe extern "C" fn CFAllocatorGetTypeID() -> CFTypeID {
@@ -81,7 +106,7 @@ pub fn supports_malloc_allocator(allocator: CFAllocatorRef) -> bool {
 /// This runtime's allocators are its own objects, which the host's
 /// CoreFoundation would read as its own `CFAllocator`. A standard one maps to
 /// the host's global of the same name, and any other to null - the host's
-/// default - since this runtime does not run custom allocator callbacks
+/// default - since this runtime does not allocate through custom callbacks
 /// either. Null, and an allocator the host made, pass through.
 #[cfg(target_os = "macos")]
 pub fn host_allocator(allocator: CFAllocatorRef) -> CFAllocatorRef {
@@ -113,16 +138,70 @@ pub fn host_allocator(allocator: CFAllocatorRef) -> CFAllocatorRef {
     allocator
 }
 
+/// `CFAllocatorRef CFAllocatorCreate(CFAllocatorRef, CFAllocatorContext *)`.
+///
+/// The context's `info` and `deallocate` are kept, so a "no copy" constructor
+/// can hand a buffer back to its deallocator.
+///
+/// FIXME (ACCURACY): the `retain`, `release`, `allocate` and `reallocate`
+/// callbacks are never called. Every object here owns its storage, so nothing
+/// is allocated through a custom allocator, and `info` is held unretained.
 pub unsafe extern "C" fn CFAllocatorCreate(
     _allocator: CFAllocatorRef,
-    _context: *const c_void,
+    context: *const CFAllocatorContext,
 ) -> CFAllocatorRef {
-    // The context's callbacks are deliberately not copied: every constructor
-    // in this implementation owns its storage and therefore treats an
-    // allocator argument as advisory. The returned object preserves the part
-    // of the contract guests can observe here: distinct identity and CF/ObjC
-    // retain/release behavior.
-    objc::object::create_instance(allocator_class(), 0) as CFAllocatorRef
+    // SAFETY: `AllocatorBody` begins with `isa` and is the layout
+    // `allocator_class` was registered with.
+    let body: *mut AllocatorBody = unsafe { crate::base::allocate(allocator_class()) };
+    if !body.is_null() && !context.is_null() {
+        // SAFETY: a fresh instance, and the caller's live context.
+        unsafe {
+            (*body).info = (*context).info;
+            (*body).deallocate = (*context).deallocate;
+        }
+    }
+    body as CFAllocatorRef
+}
+
+/// Give `buffer` to `deallocator`, as an object made by a "no copy" constructor
+/// does once it is done with the buffer.
+///
+/// The objects here copy the bytes, so they are done with it at once. Apple's
+/// CoreFoundation does the same whenever it cannot keep the buffer as it is.
+///
+/// # Safety
+///
+/// `buffer` is non-null and is the caller's to give away under `deallocator`.
+unsafe fn give_back(deallocator: CFAllocatorRef, buffer: *mut c_void) {
+    if deallocator == standard_allocator(StandardAllocator::Null) {
+        return;
+    }
+    if supports_malloc_allocator(deallocator) {
+        // SAFETY: the caller's `malloc` block, which it gave away.
+        return unsafe { objc::allocator::guest_free(buffer) };
+    }
+    #[cfg(target_os = "macos")]
+    // SAFETY: an allocator object, whose first word is readable.
+    if unsafe { crate::foreign::is(deallocator) } {
+        let Some(f) = crate::foreign::entry(c"CFAllocatorDeallocate") else {
+            objc::fail!(
+                "a \"no copy\" constructor: the deallocator is not this runtime's and there \
+                 is no host CoreFoundation to pass it to"
+            );
+        };
+        // SAFETY: `void CFAllocatorDeallocate(CFAllocatorRef, void *)`, with the
+        // host's own allocator.
+        let f: unsafe extern "C" fn(CFAllocatorRef, *mut c_void) =
+            unsafe { std::mem::transmute(f) };
+        return unsafe { f(deallocator, buffer) };
+    }
+    // SAFETY: neither a standard nor a foreign allocator, so one
+    // `CFAllocatorCreate` made.
+    let body = unsafe { &*(deallocator as *const AllocatorBody) };
+    if let Some(deallocate) = body.deallocate {
+        // SAFETY: the callback the allocator's creator supplied, as declared.
+        unsafe { deallocate(buffer, body.info) };
+    }
 }
 
 /// Hand a foreign object back to the CoreFoundation that made it.
@@ -322,17 +401,21 @@ pub unsafe extern "C" fn CFStringCreateWithFileSystemRepresentation(
 
 /// `CFStringCreateWithCStringNoCopy`, which copies here.
 ///
-/// The "no copy" contract is about the *allocator* being told who frees the
-/// buffer, and a guest that passes `kCFAllocatorNull` means "never free it".
-/// Copying is correct under every one of those spellings and wrong under none;
-/// it only costs the bytes.
+/// The string owns the buffer from here on unless `contents_deallocator` is
+/// `kCFAllocatorNull`, so the copy is followed by [`give_back`]. A failed
+/// creation leaves the buffer to the caller.
 pub unsafe extern "C" fn CFStringCreateWithCStringNoCopy(
     allocator: CFAllocatorRef,
     cstr: *const c_char,
     encoding: u32,
-    _contents_deallocator: CFAllocatorRef,
+    contents_deallocator: CFAllocatorRef,
 ) -> CFTypeRef {
-    unsafe { CFStringCreateWithCString(allocator, cstr, encoding) }
+    let string = unsafe { CFStringCreateWithCString(allocator, cstr, encoding) };
+    if !string.is_null() {
+        // SAFETY: the caller handed the buffer over with the string.
+        unsafe { give_back(contents_deallocator, cstr.cast_mut().cast()) };
+    }
+    string
 }
 
 pub unsafe extern "C" fn CFStringCreateWithBytes(
@@ -350,16 +433,20 @@ pub unsafe extern "C" fn CFStringCreateWithBytes(
     string::from_encoded(slice, encoding)
 }
 
-/// `CFStringCreateWithCharactersNoCopy`: the characters are copied anyway, as
-/// [`CFStringCreateWithCStringNoCopy`] copies its bytes, so the buffer is never
-/// handed to `contents_deallocator`.
+/// `CFStringCreateWithCharactersNoCopy`: copied, and the buffer given back, as
+/// [`CFStringCreateWithCStringNoCopy`] does.
 pub unsafe extern "C" fn CFStringCreateWithCharactersNoCopy(
     allocator: CFAllocatorRef,
     chars: *const u16,
     count: CFIndex,
-    _contents_deallocator: CFAllocatorRef,
+    contents_deallocator: CFAllocatorRef,
 ) -> CFTypeRef {
-    unsafe { CFStringCreateWithCharacters(allocator, chars, count) }
+    let string = unsafe { CFStringCreateWithCharacters(allocator, chars, count) };
+    if !string.is_null() && !chars.is_null() {
+        // SAFETY: the caller handed the buffer over with the string.
+        unsafe { give_back(contents_deallocator, chars.cast_mut().cast()) };
+    }
+    string
 }
 
 /// `CFStringRef CFStringCreateWithCharacters(CFAllocatorRef, const UniChar *,
@@ -454,13 +541,57 @@ pub unsafe extern "C" fn CFStringGetDoubleValue(value: CFTypeRef) -> f64 {
         return 0.0;
     };
     let bytes = value.utf8();
-    let text = String::from_utf8_lossy(&bytes);
+    scan_double(&String::from_utf8_lossy(&bytes)).unwrap_or(0.0)
+}
+
+/// CF's double scanner: skip whitespace, then take `nan`/`inf` case-insensitively
+/// or the longest prefix that strtod accepts. Without a locale the decimal
+/// separator is always `.`.
+fn scan_double(text: &str) -> Option<f64> {
     let text = text.trim_start();
-    let end = text
-        .char_indices()
-        .position(|(_, ch)| !(ch.is_ascii_digit() || matches!(ch, '+' | '-' | '.' | 'e' | 'E')))
-        .unwrap_or(text.len());
-    text[..end].parse().unwrap_or(0.0)
+    let special = text.get(..3).and_then(|word| {
+        if word.eq_ignore_ascii_case("nan") {
+            Some(f64::NAN)
+        } else if word.eq_ignore_ascii_case("inf") {
+            Some(f64::INFINITY)
+        } else {
+            None
+        }
+    });
+    if special.is_some() {
+        return special;
+    }
+
+    let bytes = text.as_bytes();
+    let digits_from = |start: usize| {
+        start
+            + bytes[start..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count()
+    };
+    let sign_from =
+        |start: usize| start + usize::from(matches!(bytes.get(start), Some(b'+' | b'-')));
+
+    let integer_start = sign_from(0);
+    let mut end = digits_from(integer_start);
+    let mut has_digits = end > integer_start;
+    if bytes.get(end) == Some(&b'.') {
+        let fraction_end = digits_from(end + 1);
+        has_digits |= fraction_end > end + 1;
+        end = fraction_end;
+    }
+    if !has_digits {
+        return None;
+    }
+    if matches!(bytes.get(end), Some(b'e' | b'E')) {
+        let exponent_start = sign_from(end + 1);
+        let exponent_end = digits_from(exponent_start);
+        if exponent_end > exponent_start {
+            end = exponent_end;
+        }
+    }
+    text[..end].parse().ok()
 }
 
 /// `CFStringGetMaximumSizeForEncoding`.
@@ -636,7 +767,11 @@ pub unsafe extern "C" fn CFStringGetBytes(
             let mark = external_representation != 0 && encoding == string::encoding::UTF16;
             let big_endian = encoding == string::encoding::UTF16_BE;
             let mut bytes = Vec::with_capacity((end - start) * 2 + 2 * mark as usize);
-            for unit in mark.then_some(0xFEFF_u16).iter().chain(&units[start..end]) {
+            for unit in mark
+                .then_some(BYTE_ORDER_MARK)
+                .iter()
+                .chain(&units[start..end])
+            {
                 match big_endian {
                     true => bytes.extend_from_slice(&unit.to_be_bytes()),
                     false => bytes.extend_from_slice(&unit.to_le_bytes()),
@@ -645,26 +780,20 @@ pub unsafe extern "C" fn CFStringGetBytes(
             (bytes, 2, 2 * mark as usize)
         }
         string::encoding::UTF32 | string::encoding::UTF32_BE | string::encoding::UTF32_LE => {
-            // Characters here are UTF-16 units, so a range may split a pair;
-            // the half is dropped rather than written as an invalid scalar.
-            let units = s.units();
-            if start > units.len() {
-                return 0;
-            }
-            let end = (start + length).min(units.len());
-            let mark = external_representation != 0 && encoding == string::encoding::UTF32;
-            let big_endian = encoding == string::encoding::UTF32_BE;
-            let scalars = char::decode_utf16(units[start..end].iter().copied())
-                .filter_map(Result::ok)
-                .map(u32::from);
-            let mut bytes = Vec::new();
-            for scalar in mark.then_some(0xFEFF_u32).into_iter().chain(scalars) {
-                match big_endian {
-                    true => bytes.extend_from_slice(&scalar.to_be_bytes()),
-                    false => bytes.extend_from_slice(&scalar.to_le_bytes()),
-                }
-            }
-            (bytes, 4, 4 * mark as usize)
+            // SAFETY: the caller's buffer and out-parameter, as for the others.
+            return unsafe {
+                get_bytes_utf32(
+                    &s.units(),
+                    start,
+                    length,
+                    encoding,
+                    _loss_byte,
+                    external_representation != 0,
+                    buffer,
+                    max_buffer_length,
+                    used_buffer_length,
+                )
+            };
         }
         // An encoding with no table here converts nothing, which is what a
         // caller checking the return against zero already handles.
@@ -759,6 +888,81 @@ unsafe fn get_bytes_by_character(
         unsafe { *used_buffer_length = used as CFIndex };
     }
     converted as CFIndex
+}
+
+/// U+FEFF, written first by the order-less Unicode encodings' external form.
+const BYTE_ORDER_MARK: u16 = 0xFEFF;
+
+/// `CFStringGetBytes` for the UTF-32 encodings, as Apple's
+/// `__CFStringEncodeByteStream` does it: the return counts UTF-16 units, so a
+/// surrogate pair is two characters written as one scalar. A half pair, which
+/// a range can also produce by splitting one, is written as the loss byte's
+/// value or, with no loss byte, ends the conversion.
+///
+/// # Safety
+///
+/// `buffer` is null or holds `max_buffer_length` bytes; `used_buffer_length` is
+/// null or writable.
+#[allow(clippy::too_many_arguments)]
+unsafe fn get_bytes_utf32(
+    units: &[u16],
+    start: usize,
+    length: usize,
+    encoding: u32,
+    loss_byte: u8,
+    external_representation: bool,
+    buffer: *mut u8,
+    max_buffer_length: CFIndex,
+    used_buffer_length: *mut CFIndex,
+) -> CFIndex {
+    const SCALAR_SIZE: usize = size_of::<u32>();
+    if start > units.len() {
+        return 0;
+    }
+    let end = (start + length).min(units.len());
+    let room = match buffer.is_null() {
+        true => usize::MAX,
+        false => max_buffer_length.max(0) as usize,
+    };
+    let big_endian = encoding == string::encoding::UTF32_BE;
+    let mut used = 0usize;
+    let mut write = |scalar: u32| -> bool {
+        if used + SCALAR_SIZE > room {
+            return false;
+        }
+        let bytes = match big_endian {
+            true => scalar.to_be_bytes(),
+            false => scalar.to_le_bytes(),
+        };
+        if !buffer.is_null() {
+            // SAFETY: within the `room` bytes the caller provided.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.add(used), SCALAR_SIZE) };
+        }
+        used += SCALAR_SIZE;
+        true
+    };
+    // A byte-order mark only for the order-less encoding's external form, as
+    // for UTF-16. It is not a character.
+    if external_representation && encoding == string::encoding::UTF32 {
+        write(u32::from(BYTE_ORDER_MARK));
+    }
+    let mut at = start;
+    while at < end {
+        let (scalar, span) = match char::decode_utf16(units[at..end].iter().copied()).next() {
+            Some(Ok(c)) => (u32::from(c), c.len_utf16()),
+            _ if loss_byte != 0 => (u32::from(loss_byte), 1),
+            _ => break,
+        };
+        if !write(scalar) {
+            break;
+        }
+        at += span;
+    }
+    if !used_buffer_length.is_null() {
+        // SAFETY: the caller's out-parameter.
+        unsafe { *used_buffer_length = used as CFIndex };
+    }
+    (at - start) as CFIndex
 }
 
 pub unsafe extern "C" fn CFStringCreateExternalRepresentation(
@@ -1536,7 +1740,7 @@ pub unsafe extern "C" fn CFSetGetTypeID() -> CFTypeID {
 }
 
 pub unsafe extern "C" fn CFSetGetCount(set: CFTypeRef) -> CFIndex {
-    unsafe { collections::set(set) }.map_or(0, |set| set.values.len() as CFIndex)
+    unsafe { collections::set(set) }.map_or(0, |set| set.len() as CFIndex)
 }
 
 pub unsafe extern "C" fn CFSetGetValues(set: CFTypeRef, values: *mut CFTypeRef) {
@@ -1547,7 +1751,7 @@ pub unsafe extern "C" fn CFSetGetValues(set: CFTypeRef, values: *mut CFTypeRef) 
         return;
     };
     // SAFETY: the caller provides room for CFSetGetCount entries.
-    unsafe { std::ptr::copy_nonoverlapping(set.values.as_ptr(), values, set.values.len()) };
+    unsafe { std::ptr::copy_nonoverlapping(set.values().as_ptr(), values, set.len()) };
 }
 
 pub unsafe extern "C" fn CFSetApplyFunction(
@@ -1559,7 +1763,7 @@ pub unsafe extern "C" fn CFSetApplyFunction(
         return;
     };
     // SAFETY: the caller's obligation. Copy before entering guest code.
-    let Some(values) = (unsafe { collections::set(set) }).map(|set| set.values.clone()) else {
+    let Some(values) = (unsafe { collections::set(set) }).map(|set| set.values().to_vec()) else {
         return;
     };
     for value in values {
@@ -1655,14 +1859,14 @@ pub unsafe extern "C" fn CFDictionaryAddValue(
     let Some(d) = (unsafe { collections::dictionary(dictionary) }) else {
         return;
     };
-    if !d.mutable || d.position(key).is_some() {
+    if !d.mutable || d.get(key).is_some() {
         return;
     }
     d.set(key, value);
 }
 
 pub unsafe extern "C" fn CFDictionaryGetCount(dictionary: CFTypeRef) -> CFIndex {
-    unsafe { collections::dictionary(dictionary) }.map_or(0, |d| d.entries.len() as CFIndex)
+    unsafe { collections::dictionary(dictionary) }.map_or(0, |d| d.len() as CFIndex)
 }
 
 pub type DictionaryApplierFunction = unsafe extern "C" fn(CFTypeRef, CFTypeRef, *mut c_void);
@@ -1678,7 +1882,7 @@ pub unsafe extern "C" fn CFDictionaryApplyFunction(
     // Snapshot before invoking guest code, which may mutate the dictionary.
     // SAFETY: a dictionary or null.
     let Some(entries) = (unsafe { collections::dictionary(dictionary) })
-        .map(|dictionary| dictionary.entries.clone())
+        .map(|dictionary| dictionary.entries().to_vec())
     else {
         return;
     };
@@ -1692,8 +1896,7 @@ pub unsafe extern "C" fn CFDictionaryGetValue(dictionary: CFTypeRef, key: CFType
     let Some(d) = (unsafe { collections::dictionary(dictionary) }) else {
         return std::ptr::null();
     };
-    d.position(key)
-        .map_or(std::ptr::null(), |at| d.entries[at].1)
+    d.get(key).unwrap_or(std::ptr::null())
 }
 
 pub unsafe extern "C" fn CFDictionaryGetValueIfPresent(
@@ -1704,19 +1907,18 @@ pub unsafe extern "C" fn CFDictionaryGetValueIfPresent(
     let Some(d) = (unsafe { collections::dictionary(dictionary) }) else {
         return 0;
     };
-    let Some(at) = d.position(key) else {
+    let Some(found) = d.get(key) else {
         return 0;
     };
     if !value.is_null() {
         // SAFETY: the caller supplies a writable result pointer when non-null.
-        unsafe { *value = d.entries[at].1 };
+        unsafe { *value = found };
     }
     1
 }
 
 pub unsafe extern "C" fn CFDictionaryContainsKey(dictionary: CFTypeRef, key: CFTypeRef) -> Boolean {
-    unsafe { collections::dictionary(dictionary) }.is_some_and(|d| d.position(key).is_some())
-        as Boolean
+    unsafe { collections::dictionary(dictionary) }.is_some_and(|d| d.get(key).is_some()) as Boolean
 }
 
 /// `CFDictionaryGetKeysAndValues`: both sides, in one pass, into the caller's
@@ -1729,7 +1931,7 @@ pub unsafe extern "C" fn CFDictionaryGetKeysAndValues(
     let Some(d) = (unsafe { collections::dictionary(dictionary) }) else {
         return;
     };
-    for (i, (key, value)) in d.entries.iter().enumerate() {
+    for (i, (key, value)) in d.entries().iter().enumerate() {
         // SAFETY: the caller says each non-null array has room for `GetCount`
         // entries, which is what this loop writes.
         unsafe {
@@ -1757,7 +1959,7 @@ pub unsafe extern "C" fn CFBooleanGetValue(value: CFTypeRef) -> Boolean {
 
 pub unsafe extern "C" fn CFNumberCreate(
     _allocator: CFAllocatorRef,
-    kind: i32,
+    kind: CFIndex,
     value: *const c_void,
 ) -> CFTypeRef {
     let (Some((width, is_float)), false) = (collections::number_shape(kind), value.is_null())
@@ -1790,7 +1992,7 @@ pub unsafe extern "C" fn CFNumberCreate(
 /// is the only behaviour that makes a working program keep working.
 pub unsafe extern "C" fn CFNumberGetValue(
     number: CFTypeRef,
-    kind: i32,
+    kind: CFIndex,
     out: *mut c_void,
 ) -> Boolean {
     let (Some(n), Some((width, is_float)), false) = (
@@ -1831,7 +2033,7 @@ pub unsafe extern "C" fn CFNumberIsFloatType(number: CFTypeRef) -> Boolean {
 ///
 /// Zero, which is no type, for anything that is not a number.
 pub unsafe extern "C" fn CFNumberGetType(number: CFTypeRef) -> CFIndex {
-    unsafe { collections::number_type(number) }.map_or(0, |kind| kind as CFIndex)
+    unsafe { collections::number_type(number) }.unwrap_or(0)
 }
 
 /// The width of the number's canonical type.
@@ -1861,20 +2063,22 @@ pub unsafe extern "C" fn CFDataCreate(
     collections::new_data(slice.to_vec())
 }
 
-/// `CFDataCreateWithBytesNoCopy` with an owned compatibility copy.
-///
-/// CoreFoundation can borrow the caller's buffer and later release it through
-/// `contents_deallocator`. This runtime's data objects own a `Vec`, so copying
-/// preserves the bytes for the object's lifetime without trying to interpret a
-/// foreign allocator object.
+/// `CFDataCreateWithBytesNoCopy`: this runtime's data objects own a `Vec`, so
+/// the bytes are copied and the buffer given back, as
+/// [`CFStringCreateWithCStringNoCopy`] does.
 pub unsafe extern "C" fn CFDataCreateWithBytesNoCopy(
     allocator: CFAllocatorRef,
     bytes: *const u8,
     length: CFIndex,
-    _contents_deallocator: CFAllocatorRef,
+    contents_deallocator: CFAllocatorRef,
 ) -> CFTypeRef {
     // SAFETY: the validity requirement is identical to `CFDataCreate`'s.
-    unsafe { CFDataCreate(allocator, bytes, length) }
+    let data = unsafe { CFDataCreate(allocator, bytes, length) };
+    if !data.is_null() && !bytes.is_null() {
+        // SAFETY: the caller handed the buffer over with the data.
+        unsafe { give_back(contents_deallocator, bytes.cast_mut().cast()) };
+    }
+    data
 }
 
 /// `CFDataCreateCopy`, which forwards a foreign original rather than reading it.
@@ -3185,7 +3389,10 @@ fn absolute_time() -> f64 {
         .unwrap_or(0.0)
 }
 
-pub unsafe extern "C" fn CFAbsoluteTimeGetCurrent() -> f64 {
+pub type CFTimeInterval = f64;
+pub type CFAbsoluteTime = CFTimeInterval;
+
+pub unsafe extern "C" fn CFAbsoluteTimeGetCurrent() -> CFAbsoluteTime {
     absolute_time()
 }
 
@@ -3480,18 +3687,23 @@ pub unsafe extern "C" fn CFStringGetFileSystemRepresentation(
 }
 
 /// `CFStringRef CFStringCreateWithBytesNoCopy(CFAllocatorRef, const UInt8 *,
-/// CFIndex, CFStringEncoding, Boolean, CFAllocatorRef)`, which copies here for
-/// [`CFStringCreateWithCStringNoCopy`]'s reason.
+/// CFIndex, CFStringEncoding, Boolean, CFAllocatorRef)`: copied, and the buffer
+/// given back, as [`CFStringCreateWithCStringNoCopy`] does.
 pub unsafe extern "C" fn CFStringCreateWithBytesNoCopy(
     allocator: CFAllocatorRef,
     bytes: *const u8,
     length: CFIndex,
     encoding: u32,
     external: Boolean,
-    _contents_deallocator: CFAllocatorRef,
+    contents_deallocator: CFAllocatorRef,
 ) -> CFTypeRef {
     // SAFETY: the validity requirement is identical to `CFStringCreateWithBytes`'.
-    unsafe { CFStringCreateWithBytes(allocator, bytes, length, encoding, external) }
+    let string = unsafe { CFStringCreateWithBytes(allocator, bytes, length, encoding, external) };
+    if !string.is_null() {
+        // SAFETY: the caller handed the buffer over with the string.
+        unsafe { give_back(contents_deallocator, bytes.cast_mut().cast()) };
+    }
+    string
 }
 
 /// `CFArrayRef CFArrayCreateCopy(CFAllocatorRef, CFArrayRef)`
@@ -3563,7 +3775,9 @@ pub unsafe extern "C" fn CFDictionaryCreateCopy(
     let Some(d) = (unsafe { collections::dictionary(dictionary) }) else {
         return std::ptr::null();
     };
-    collections::new_dictionary(&d.entries.clone(), d.keys, d.values, false)
+    // A snapshot: the callbacks can run guest code that changes the source.
+    let entries = d.entries().to_vec();
+    collections::new_dictionary(&entries, d.keys, d.values, false)
 }
 
 /// `CFMutableDictionaryRef CFDictionaryCreateMutableCopy(CFAllocatorRef,
@@ -3577,7 +3791,9 @@ pub unsafe extern "C" fn CFDictionaryCreateMutableCopy(
     let Some(d) = (unsafe { collections::dictionary(dictionary) }) else {
         return std::ptr::null();
     };
-    collections::new_dictionary(&d.entries.clone(), d.keys, d.values, true)
+    // A snapshot: the callbacks can run guest code that changes the source.
+    let entries = d.entries().to_vec();
+    collections::new_dictionary(&entries, d.keys, d.values, true)
 }
 
 /// `CFIndex CFDictionaryGetCountOfKey(CFDictionaryRef, const void *key)`
@@ -3590,7 +3806,7 @@ pub unsafe extern "C" fn CFDictionaryGetCountOfKey(
     let Some(d) = (unsafe { collections::dictionary(dictionary) }) else {
         return 0;
     };
-    CFIndex::from(d.position(key).is_some())
+    CFIndex::from(d.get(key).is_some())
 }
 
 /// `UInt8 *CFDataGetMutableBytePtr(CFMutableDataRef)`
@@ -3800,6 +4016,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn double_value_reads_the_longest_numeric_prefix() {
+        assert_eq!(scan_double("2.5e"), Some(2.5));
+        assert_eq!(scan_double("1-2"), Some(1.0));
+        assert_eq!(scan_double("2.5e+3x"), Some(2500.0));
+        assert_eq!(scan_double("-.5E-1"), Some(-0.05));
+        assert_eq!(scan_double("7."), Some(7.0));
+        assert_eq!(scan_double("1.2.3"), Some(1.2));
+        assert_eq!(scan_double("0x10"), Some(0.0));
+    }
+
+    #[test]
+    fn double_value_skips_leading_whitespace() {
+        assert_eq!(scan_double(" \t\n42"), Some(42.0));
+    }
+
+    #[test]
+    fn double_value_rejects_text_without_digits() {
+        assert_eq!(scan_double(""), None);
+        assert_eq!(scan_double("."), None);
+        assert_eq!(scan_double("-e5"), None);
+        assert_eq!(scan_double("abc"), None);
+    }
+
+    #[test]
+    fn double_value_reads_nan_and_inf_case_insensitively() {
+        assert!(scan_double("NaN").is_some_and(f64::is_nan));
+        assert_eq!(scan_double("Infinity"), Some(f64::INFINITY));
+        assert_eq!(scan_double("-inf"), None);
+    }
+
+    #[test]
+    fn get_double_value_returns_zero_without_a_number() {
+        // SAFETY: plain calls on live strings built from NUL-terminated literals.
+        unsafe {
+            let string = |text: &core::ffi::CStr| {
+                CFStringCreateWithCString(core::ptr::null(), text.as_ptr(), string::encoding::UTF8)
+            };
+            assert_eq!(CFStringGetDoubleValue(string(c"2.5e")), 2.5);
+            assert_eq!(CFStringGetDoubleValue(string(c"value")), 0.0);
+        }
+    }
+
+    #[test]
     fn a_windows_code_page_or_charset_name_names_its_encoding() {
         // SAFETY: plain calls; the strings are live NUL-terminated literals.
         unsafe {
@@ -3865,17 +4124,21 @@ mod tests {
 
     #[test]
     fn no_copy_data_keeps_an_owned_snapshot() {
-        let mut source = vec![1u8, 2, 3];
+        let mut source = [1u8, 2, 3];
         // SAFETY: `source` covers the stated length.
         let data = unsafe {
             CFDataCreateWithBytesNoCopy(
                 std::ptr::null(),
                 source.as_ptr(),
                 source.len() as CFIndex,
-                std::ptr::null(),
+                standard_allocator(StandardAllocator::Null),
             )
         };
-        source[0] = 9;
+        // The write is the point: the data must not observe it.
+        #[allow(unused_assignments)]
+        {
+            source[0] = 9;
+        }
 
         // SAFETY: `data` was created above and remains retained.
         let bytes = unsafe {
@@ -3892,5 +4155,184 @@ mod tests {
     fn a_non_data_has_no_bytes() {
         // SAFETY: null is the documented "not an object" case.
         assert!(unsafe { CFDataGetBytePtr(std::ptr::null()) }.is_null());
+    }
+}
+
+#[cfg(test)]
+mod no_copy_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Every block `recording_free` has seen, whichever test freed it.
+    static FREED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    /// Serialises the tests that swap the guest allocator.
+    static GUEST_ALLOCATOR: Mutex<()> = Mutex::new(());
+
+    unsafe extern "C" fn host_malloc(size: usize) -> *mut c_void {
+        // SAFETY: the host's own, with the caller's size.
+        unsafe { libc::malloc(size) }
+    }
+
+    unsafe extern "C" fn recording_free(block: *mut c_void) {
+        FREED.lock().unwrap().push(block as usize);
+        // SAFETY: a block `host_malloc` returned.
+        unsafe { libc::free(block) };
+    }
+
+    fn was_freed(block: *const c_void) -> bool {
+        FREED.lock().unwrap().contains(&(block as usize))
+    }
+
+    /// `bytes` in a fresh `malloc` block.
+    fn malloc_copy(bytes: &[u8]) -> *mut u8 {
+        // SAFETY: a block of the right size, filled before it is handed out.
+        unsafe {
+            let block = libc::malloc(bytes.len()).cast::<u8>();
+            assert!(!block.is_null());
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), block, bytes.len());
+            block
+        }
+    }
+
+    /// Run `body` with `recording_free` as the guest's `free`.
+    fn with_recording_free(body: impl FnOnce()) {
+        let _guard = GUEST_ALLOCATOR.lock().unwrap();
+        objc::allocator::register(
+            host_malloc as *const () as usize,
+            recording_free as *const () as usize,
+        );
+        body();
+        objc::allocator::register(0, 0);
+    }
+
+    #[test]
+    fn default_deallocator_frees_the_buffer_once_the_data_holds_it() {
+        with_recording_free(|| {
+            let buffer = malloc_copy(b"abc");
+            // SAFETY: a malloc'd buffer of the stated length, given away.
+            let data = unsafe {
+                CFDataCreateWithBytesNoCopy(std::ptr::null(), buffer, 3, std::ptr::null())
+            };
+            assert!(was_freed(buffer.cast()));
+            // SAFETY: `data` is live; balances the create rule.
+            unsafe {
+                assert_eq!(CFDataGetLength(data), 3);
+                CFRelease(data);
+            }
+        });
+    }
+
+    #[test]
+    fn every_malloc_deallocator_frees_a_string_buffer() {
+        with_recording_free(|| {
+            for deallocator in [
+                std::ptr::null(),
+                standard_allocator(StandardAllocator::SystemDefault),
+                standard_allocator(StandardAllocator::Malloc),
+                standard_allocator(StandardAllocator::MallocZone),
+            ] {
+                let buffer = malloc_copy(b"hi\0");
+                // SAFETY: a malloc'd NUL-terminated string, given away.
+                let string = unsafe {
+                    CFStringCreateWithCStringNoCopy(
+                        std::ptr::null(),
+                        buffer.cast(),
+                        string::encoding::UTF8,
+                        deallocator,
+                    )
+                };
+                assert!(was_freed(buffer.cast()), "{deallocator:p}");
+                // SAFETY: `string` is live; balances the create rule.
+                unsafe {
+                    assert_eq!(CFStringGetLength(string), 2);
+                    CFRelease(string);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn null_deallocator_leaves_the_buffer_to_the_caller() {
+        with_recording_free(|| {
+            let buffer = malloc_copy(b"abc");
+            let null = standard_allocator(StandardAllocator::Null);
+            // SAFETY: a buffer of the stated length, which the caller keeps.
+            unsafe {
+                let string = CFStringCreateWithBytesNoCopy(
+                    std::ptr::null(),
+                    buffer,
+                    3,
+                    string::encoding::UTF8,
+                    0,
+                    null,
+                );
+                assert!(!string.is_null());
+                CFRelease(string);
+            }
+            assert!(!was_freed(buffer.cast()));
+            // SAFETY: still the caller's own block.
+            unsafe { libc::free(buffer.cast()) };
+        });
+    }
+
+    #[test]
+    fn a_failed_creation_leaves_the_buffer_to_the_caller() {
+        with_recording_free(|| {
+            let buffer = malloc_copy(b"abc");
+            // SAFETY: a negative length is refused before the bytes are read.
+            let string = unsafe {
+                CFStringCreateWithBytesNoCopy(
+                    std::ptr::null(),
+                    buffer,
+                    -1,
+                    string::encoding::UTF8,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            assert!(string.is_null());
+            assert!(!was_freed(buffer.cast()));
+            // SAFETY: still the caller's own block.
+            unsafe { libc::free(buffer.cast()) };
+        });
+    }
+
+    #[test]
+    fn a_custom_deallocator_receives_the_buffer_and_its_info() {
+        static SEEN: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+        unsafe extern "C" fn deallocate(block: *mut c_void, info: *mut c_void) {
+            SEEN.lock().unwrap().push((block as usize, info as usize));
+        }
+        let mut info = 0u8;
+        let info: *mut c_void = (&raw mut info).cast();
+        let context = CFAllocatorContext {
+            version: 0,
+            info,
+            retain: std::ptr::null(),
+            release: std::ptr::null(),
+            copy_description: std::ptr::null(),
+            allocate: std::ptr::null(),
+            reallocate: std::ptr::null(),
+            deallocate: Some(deallocate),
+            preferred_size: std::ptr::null(),
+        };
+        let chars: [u16; 2] = [u16::from(b'o'), u16::from(b'k')];
+        // SAFETY: a live context, and a buffer the deallocator above only records.
+        unsafe {
+            let allocator = CFAllocatorCreate(std::ptr::null(), &context);
+            let string = CFStringCreateWithCharactersNoCopy(
+                std::ptr::null(),
+                chars.as_ptr(),
+                chars.len() as CFIndex,
+                allocator,
+            );
+            assert_eq!(CFStringGetLength(string), 2);
+            CFRelease(string);
+            CFRelease(allocator);
+        }
+        assert_eq!(
+            *SEEN.lock().unwrap(),
+            [(chars.as_ptr() as usize, info as usize)]
+        );
     }
 }

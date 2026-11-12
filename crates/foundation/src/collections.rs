@@ -419,6 +419,8 @@ unsafe extern "C" fn add_objects_from_array(receiver: Id, _sel: Sel, other: Id) 
     }
 }
 
+/// `-removeObjectAtIndex:`. Past the end is Apple's range exception, which
+/// fails here by name.
 unsafe extern "C" fn remove_object_at_index(receiver: Id, _sel: Sel, index: usize) {
     // SAFETY: an array.
     let Some(a) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
@@ -427,10 +429,14 @@ unsafe extern "C" fn remove_object_at_index(receiver: Id, _sel: Sel, index: usiz
     if !a.mutable {
         immutable("NSArray", "removeObjectAtIndex:");
     }
-    if index < a.values.len() {
-        let gone = a.values.remove(index);
-        a.policy.release(gone);
+    if index >= a.values.len() {
+        objc::fail!(
+            "-[NSMutableArray removeObjectAtIndex:]: index {index} of {}",
+            a.values.len()
+        );
     }
+    let gone = a.values.remove(index);
+    a.policy.release(gone);
 }
 
 unsafe extern "C" fn remove_last_object(receiver: Id, sel: Sel) {
@@ -670,7 +676,7 @@ unsafe extern "C" fn dictionary_description(receiver: Id, _sel: Sel) -> Id {
         return std::ptr::null_mut();
     };
     let mut out: Vec<u8> = b"{\n".to_vec();
-    for (key, value) in &dictionary.entries {
+    for (key, value) in dictionary.entries() {
         out.extend_from_slice(b"    ");
         // SAFETY: a key of a live dictionary.
         out.extend_from_slice(&unsafe { describe(*key as Id) });
@@ -1059,7 +1065,7 @@ static NEVER_MUTATED: usize = 0;
 /// `state` must be a writable `NSFastEnumerationState`, and `values` must
 /// outlive the loop - which it does, because a mutation during enumeration is
 /// the program's error and the one this cannot detect.
-unsafe fn enumerate(state: *mut FastEnumerationState, values: &mut [CFTypeRef]) -> usize {
+unsafe fn enumerate(state: *mut FastEnumerationState, values: &[CFTypeRef]) -> usize {
     if state.is_null() {
         return 0;
     }
@@ -1068,7 +1074,8 @@ unsafe fn enumerate(state: *mut FastEnumerationState, values: &mut [CFTypeRef]) 
         return 0;
     }
     state.state = 1;
-    state.items = values.as_mut_ptr() as *mut Id;
+    // The guest only reads through `items`.
+    state.items = values.as_ptr() as *mut Id;
     state.mutations = &NEVER_MUTATED as *const usize as *mut usize;
     values.len()
 }
@@ -1086,7 +1093,7 @@ unsafe extern "C" fn array_enumerate(
     };
     // SAFETY: the guest's own state structure, and storage that outlives the
     // loop.
-    unsafe { enumerate(state, &mut array.values) }
+    unsafe { enumerate(state, &array.values) }
 }
 
 /// The dictionary's, which enumerates **keys** - as `for (id key in dict)` does.
@@ -1116,14 +1123,14 @@ unsafe extern "C" fn dictionary_enumerate(
     // SAFETY: the guest's own state structure.
     let state = unsafe { &mut *state };
     let from = state.state;
-    let batch = dictionary.entries.len().saturating_sub(from).min(len);
+    let batch = dictionary.len().saturating_sub(from).min(len);
     if batch == 0 {
         return 0;
     }
     for i in 0..batch {
         // SAFETY: the caller said `buffer` holds `len` items, and `batch` is at
         // most that.
-        unsafe { *buffer.add(i) = dictionary.entries[from + i].0 as Id };
+        unsafe { *buffer.add(i) = dictionary.entries()[from + i].0 as Id };
     }
     state.state = from + batch;
     state.items = buffer;
@@ -1404,11 +1411,7 @@ unsafe extern "C" fn remove_object_for_key(receiver: Id, _sel: Sel, key: Id) {
     if !d.mutable {
         immutable("NSDictionary", "removeObjectForKey:");
     }
-    if let Some(at) = d.position(key as CFTypeRef) {
-        let (key, value) = d.entries.remove(at);
-        d.keys.release(key);
-        d.values.release(value);
-    }
+    d.discard(key as CFTypeRef);
 }
 
 unsafe extern "C" fn dictionary_remove_all_objects(receiver: Id, _sel: Sel) {
@@ -1422,7 +1425,7 @@ unsafe extern "C" fn dictionary_remove_all_objects(receiver: Id, _sel: Sel) {
     // Taken first: a release can run a guest `dealloc` that reads this
     // dictionary again.
     let (keys, values) = (d.keys, d.values);
-    for (key, value) in std::mem::take(&mut d.entries) {
+    for (key, value) in d.take_all() {
         keys.release(key);
         values.release(value);
     }
@@ -1440,7 +1443,7 @@ fn entries_of(other: Id, what: &str) -> Option<Vec<(CFTypeRef, CFTypeRef)>> {
     }
     // SAFETY: a dictionary if it is one of ours.
     match unsafe { collections::dictionary(other as CFTypeRef) } {
-        Some(d) => Some(d.entries.clone()),
+        Some(d) => Some(d.entries().to_vec()),
         None => objc::fail!("{what}: the argument is not a dictionary"),
     }
 }
@@ -1474,14 +1477,14 @@ unsafe extern "C" fn set_dictionary(receiver: Id, _sel: Sel, other: Id) {
         immutable("NSDictionary", "setDictionary:");
     }
     let entries = entries_of(other, "-[NSMutableDictionary setDictionary:]").unwrap_or_default();
-    // Retained before the old pairs go, since the argument may be the receiver
-    // or share its objects.
+    // The old pairs are released only after the new ones are in, since the
+    // argument may be the receiver or share its objects.
     let (keys, values) = (d.keys, d.values);
-    let fresh: Vec<_> = entries
-        .into_iter()
-        .map(|(k, v)| (keys.retain(k), values.retain(v)))
-        .collect();
-    for (key, value) in std::mem::replace(&mut d.entries, fresh) {
+    let old = d.take_all();
+    for (key, value) in entries {
+        d.set(key, value);
+    }
+    for (key, value) in old {
         keys.release(key);
         values.release(value);
     }
@@ -1505,11 +1508,7 @@ unsafe extern "C" fn remove_objects_for_keys(receiver: Id, _sel: Sel, keys: Id) 
     };
     let doomed = array.values.clone();
     for key in doomed {
-        if let Some(at) = d.position(key) {
-            let (k, v) = d.entries.remove(at);
-            d.keys.release(k);
-            d.values.release(v);
-        }
+        d.discard(key);
     }
 }
 
@@ -1584,7 +1583,7 @@ unsafe extern "C" fn all_keys_for_object(receiver: Id, _sel: Sel, object: Id) ->
         return std::ptr::null_mut();
     };
     let keys: Vec<CFTypeRef> = d
-        .entries
+        .entries()
         .iter()
         .filter(|(_, v)| d.values.equal(*v, object as CFTypeRef))
         .map(|(k, _)| *k)
@@ -1618,10 +1617,7 @@ unsafe extern "C" fn objects_for_keys_not_found_marker(
     let values: Vec<CFTypeRef> = keys
         .values
         .iter()
-        .map(|key| match d.position(*key) {
-            Some(at) => d.entries[at].1,
-            None => marker as CFTypeRef,
-        })
+        .map(|key| d.get(*key).unwrap_or(marker as CFTypeRef))
         .collect();
     // SAFETY: a fresh object holding live ones.
     unsafe {
@@ -1642,11 +1638,10 @@ unsafe extern "C" fn is_equal_to_dictionary(receiver: Id, _sel: Sel, other: Id) 
     ) else {
         return false;
     };
-    a.entries.len() == b.entries.len()
-        && a.entries.iter().all(|(k, v)| {
-            b.position(*k)
-                .is_some_and(|at| a.values.equal(*v, b.entries[at].1))
-        })
+    a.len() == b.len()
+        && a.entries()
+            .iter()
+            .all(|(k, v)| b.get(*k).is_some_and(|w| a.values.equal(*v, w)))
 }
 
 /// `-keyEnumerator`: a snapshot, so the dictionary may change under it.
@@ -1667,7 +1662,7 @@ unsafe extern "C" fn all_keys(receiver: Id, _sel: Sel) -> Id {
     let Some(d) = (unsafe { collections::dictionary(receiver as CFTypeRef) }) else {
         return std::ptr::null_mut();
     };
-    let keys: Vec<CFTypeRef> = d.entries.iter().map(|(k, _)| *k).collect();
+    let keys: Vec<CFTypeRef> = d.entries().iter().map(|(k, _)| *k).collect();
     // SAFETY: a fresh object holding live ones.
     unsafe {
         api::CFAutorelease(collections::new_array(
@@ -1683,7 +1678,7 @@ unsafe extern "C" fn all_values(receiver: Id, _sel: Sel) -> Id {
     let Some(d) = (unsafe { collections::dictionary(receiver as CFTypeRef) }) else {
         return std::ptr::null_mut();
     };
-    let values: Vec<CFTypeRef> = d.entries.iter().map(|(_, v)| *v).collect();
+    let values: Vec<CFTypeRef> = d.entries().iter().map(|(_, v)| *v).collect();
     // SAFETY: a fresh object holding live ones.
     unsafe {
         api::CFAutorelease(collections::new_array(
@@ -1736,7 +1731,7 @@ fn copy_dictionary(receiver: Id, mutable: bool) -> Id {
         return std::ptr::null_mut();
     };
     collections::new_dictionary(
-        &dictionary.entries,
+        dictionary.entries(),
         Policy::from_key_callbacks(),
         Policy::from_type_callbacks(),
         mutable,
@@ -1755,8 +1750,8 @@ unsafe extern "C" fn dictionary_mutable_copy_with_zone(
     unsafe { dictionary_mutable_copy(receiver, sel) }
 }
 
-/// `-init` on `NSMutableArray` and `NSMutableDictionary`, which are class
-/// clusters.
+/// `-init` on `NSMutableArray`, `NSMutableDictionary` and `NSMutableSet`,
+/// which are class clusters.
 ///
 /// `+alloc` on one of those answers an instance of the abstract class itself -
 /// an isa and nothing else - because that is all an abstract class has room
@@ -1927,38 +1922,40 @@ unsafe extern "C" fn data_with_bytes(_class: Id, _sel: Sel, bytes: *const u8, le
     unsafe { api::CFAutorelease(api::CFDataCreate(std::ptr::null(), bytes, length as isize)) as Id }
 }
 
-/// `+[NSData dataWithBytesNoCopy:length:]` with an owned compatibility copy.
-///
-/// CoreFoundation's data storage owns a `Vec`, so use the same compatibility
-/// behavior as `CFDataCreateWithBytesNoCopy` rather than borrowing guest memory.
+/// `+[NSData dataWithBytesNoCopy:length:]`, which takes the buffer: this is
+/// `freeWhenDone:YES`.
 unsafe extern "C" fn data_with_bytes_no_copy(
+    class: Id,
+    sel: Sel,
+    bytes: *const u8,
+    length: usize,
+) -> Id {
+    // SAFETY: forwarded.
+    unsafe { data_with_bytes_no_copy_free(class, sel, bytes, length, 1) }
+}
+
+/// `+[NSData dataWithBytesNoCopy:length:freeWhenDone:]`: CoreFoundation's
+/// "no copy" data, with the buffer kept by the caller unless it is to be freed.
+unsafe extern "C" fn data_with_bytes_no_copy_free(
     _class: Id,
     _sel: Sel,
     bytes: *const u8,
     length: usize,
+    free_when_done: u8,
 ) -> Id {
+    let deallocator = match free_when_done {
+        0 => api::standard_allocator(api::StandardAllocator::Null),
+        _ => std::ptr::null(),
+    };
     // SAFETY: the caller says `bytes` covers `length` bytes.
     unsafe {
         api::CFAutorelease(api::CFDataCreateWithBytesNoCopy(
             std::ptr::null(),
             bytes,
             length as isize,
-            std::ptr::null(),
+            deallocator,
         )) as Id
     }
-}
-
-/// `+[NSData dataWithBytesNoCopy:length:freeWhenDone:]`, which is the copy above:
-/// the buffer a guest asked to be freed is simply left to it.
-unsafe extern "C" fn data_with_bytes_no_copy_free(
-    class: Id,
-    sel: Sel,
-    bytes: *const u8,
-    length: usize,
-    _free_when_done: u8,
-) -> Id {
-    // SAFETY: the same contract.
-    unsafe { data_with_bytes_no_copy(class, sel, bytes, length) }
 }
 
 /// The bytes of a data object, or empty for nil or anything else.
@@ -2017,9 +2014,8 @@ unsafe extern "C" fn data_init_with_bytes(
     replace_receiver(receiver, unsafe { raw(bytes, length) }.to_vec())
 }
 
-/// `-initWithBytesNoCopy:length:freeWhenDone:`. Copied, as
-/// [`data_with_bytes_no_copy`] explains, and the caller's buffer released
-/// now when it handed it over.
+/// `-initWithBytesNoCopy:length:freeWhenDone:`. Copied, since data here owns a
+/// `Vec`, and the caller's buffer released now when it handed it over.
 unsafe extern "C" fn data_init_no_copy_free(
     receiver: Id,
     _sel: Sel,
@@ -2367,17 +2363,18 @@ unsafe extern "C" fn number_is_equal(receiver: Id, _sel: Sel, other: Id) -> bool
     numbers_equal(a, b)
 }
 
-/// `-hash`, equal for numbers `-isEqual:` calls equal: an integral float
-/// hashes as the integer.
-unsafe extern "C" fn number_hash(receiver: Id, _sel: Sel) -> usize {
-    // SAFETY: a number.
-    let Some(n) = (unsafe { collections::number(receiver as CFTypeRef) }) else {
-        return receiver as usize;
-    };
+/// The `-hash` of a number of value `n`, equal for numbers `-isEqual:` calls
+/// equal: an integral float hashes as the integer.
+pub(crate) fn number_hash_of(n: collections::Number) -> usize {
     match n {
         collections::Number::Float(f) if f.fract() != 0.0 || !f.is_finite() => f.to_bits() as usize,
         n => n.as_i64() as usize,
     }
+}
+
+unsafe extern "C" fn number_hash(receiver: Id, _sel: Sel) -> usize {
+    // SAFETY: a number.
+    unsafe { collections::number(receiver as CFTypeRef) }.map_or(receiver as usize, number_hash_of)
 }
 
 /// `-compare:`: `NSOrderedAscending` is -1, `NSOrderedDescending` is 1.
@@ -2552,6 +2549,22 @@ unsafe extern "C" fn set_with_capacity(_class: Id, _sel: Sel, _capacity: usize) 
     unsafe { api::CFAutorelease(collections::new_set(&[], Policy::from_type_callbacks())) as Id }
 }
 
+/// `-initWithCapacity:`, where the capacity is a hint this store has no use for.
+unsafe extern "C" fn init_mutable_set_with_capacity(
+    receiver: Id,
+    _sel: Sel,
+    _capacity: usize,
+) -> Id {
+    // SAFETY: an object of this class.
+    let known = unsafe { collections::set(receiver as CFTypeRef) }.is_some();
+    // SAFETY: as above, with a fresh empty set.
+    unsafe {
+        cluster_init(receiver, known, || {
+            collections::new_set(&[], Policy::from_type_callbacks())
+        })
+    }
+}
+
 unsafe extern "C" fn set_with_array(_class: Id, _sel: Sel, array: Id) -> Id {
     // SAFETY: the argument is an NSArray or nil.
     let values = unsafe { collections::array(array as CFTypeRef) }
@@ -2574,15 +2587,8 @@ unsafe extern "C" fn set_with_objects_count(
         // SAFETY: the caller says `objects` covers `count` entries.
         false => unsafe { std::slice::from_raw_parts(objects as *const CFTypeRef, count) },
     };
-    let mut unique: Vec<CFTypeRef> = Vec::with_capacity(values.len());
-    let policy = Policy::from_type_callbacks();
-    for value in values {
-        if !unique.iter().any(|u| policy.equal(*u, *value)) {
-            unique.push(*value);
-        }
-    }
-    // SAFETY: the new set retains its elements.
-    unsafe { api::CFAutorelease(collections::new_set(&unique, policy)) as Id }
+    // SAFETY: the new set retains its elements, keeping the first of equals.
+    unsafe { api::CFAutorelease(collections::new_set(values, Policy::from_type_callbacks())) as Id }
 }
 
 unsafe extern "C" fn set_init_with_objects_count(
@@ -2615,16 +2621,13 @@ unsafe extern "C" fn set_with_collection(class: Id, sel: Sel, other: Id) -> Id {
 
 unsafe extern "C" fn set_count(receiver: Id, _sel: Sel) -> usize {
     // SAFETY: a set.
-    unsafe { collections::set(receiver as CFTypeRef) }.map_or(0, |set| set.values.len())
+    unsafe { collections::set(receiver as CFTypeRef) }.map_or(0, |set| set.len())
 }
 
 unsafe extern "C" fn set_contains_object(receiver: Id, _sel: Sel, object: Id) -> bool {
     // SAFETY: a set.
-    unsafe { collections::set(receiver as CFTypeRef) }.is_some_and(|set| {
-        set.values
-            .iter()
-            .any(|value| set.policy.equal(*value, object as CFTypeRef))
-    })
+    unsafe { collections::set(receiver as CFTypeRef) }
+        .is_some_and(|set| set.contains(object as CFTypeRef))
 }
 
 /// `-addObject:`, which keeps the set's contents unique under its own equality.
@@ -2636,14 +2639,7 @@ unsafe extern "C" fn set_add_object(receiver: Id, _sel: Sel, object: Id) {
     let Some(set) = (unsafe { collections::set(receiver as CFTypeRef) }) else {
         return;
     };
-    let object = object as CFTypeRef;
-    if !set
-        .values
-        .iter()
-        .any(|value| set.policy.equal(*value, object))
-    {
-        set.values.push(set.policy.retain(object));
-    }
+    set.insert(object as CFTypeRef);
 }
 
 /// `-copy` and `-mutableCopy` of a set: a new set of the same objects, for the
@@ -2653,7 +2649,7 @@ fn copy_set(receiver: Id) -> Id {
     let Some(set) = (unsafe { collections::set(receiver as CFTypeRef) }) else {
         return std::ptr::null_mut();
     };
-    let values = set.values.clone();
+    let values = set.values().to_vec();
     collections::new_set(&values, Policy::from_type_callbacks()) as Id
 }
 
@@ -2673,7 +2669,7 @@ unsafe extern "C" fn set_copy_with_zone(receiver: Id, _sel: Sel, _zone: *const (
 unsafe fn set_members_array(receiver: Id) -> Id {
     // SAFETY: a set, by the caller.
     let values = unsafe { collections::set(receiver as CFTypeRef) }
-        .map(|set| set.values.clone())
+        .map(|set| set.values().to_vec())
         .unwrap_or_default();
     // SAFETY: a fresh object holding live ones.
     unsafe {
@@ -2699,12 +2695,7 @@ unsafe extern "C" fn set_object_enumerator(receiver: Id, _sel: Sel) -> Id {
 unsafe extern "C" fn set_member(receiver: Id, _sel: Sel, object: Id) -> Id {
     // SAFETY: a set.
     unsafe { collections::set(receiver as CFTypeRef) }
-        .and_then(|set| {
-            set.values
-                .iter()
-                .find(|value| set.policy.equal(**value, object as CFTypeRef))
-                .copied()
-        })
+        .and_then(|set| set.member(object as CFTypeRef))
         .map_or(std::ptr::null_mut(), |value| value as Id)
 }
 
@@ -2717,7 +2708,7 @@ unsafe fn members_of(collection: Id) -> Vec<CFTypeRef> {
     // SAFETY: the caller's obligation.
     unsafe {
         if let Some(set) = collections::set(collection as CFTypeRef) {
-            return set.values.clone();
+            return set.values().to_vec();
         }
         collections::array(collection as CFTypeRef)
             .map(|array| array.values.clone())
@@ -2735,13 +2726,9 @@ unsafe fn set_adding(receiver: Id, extra: &[CFTypeRef]) -> Id {
     let Some(set) = (unsafe { collections::set(receiver as CFTypeRef) }) else {
         return std::ptr::null_mut();
     };
-    let mut values = set.values.clone();
-    for value in extra {
-        if !values.iter().any(|v| set.policy.equal(*v, *value)) {
-            values.push(*value);
-        }
-    }
-    // SAFETY: a fresh object holding live ones.
+    let values = [set.values(), extra].concat();
+    // SAFETY: a fresh object holding live ones; it keeps the first of equals,
+    // so the receiver's own members.
     unsafe {
         api::CFAutorelease(collections::new_set(&values, Policy::from_type_callbacks())) as Id
     }
@@ -2770,12 +2757,7 @@ unsafe extern "C" fn set_remove_object(receiver: Id, _sel: Sel, object: Id) {
     let Some(set) = (unsafe { collections::set(receiver as CFTypeRef) }) else {
         return;
     };
-    if let Some(at) = set
-        .values
-        .iter()
-        .position(|value| set.policy.equal(*value, object as CFTypeRef))
-    {
-        let value = set.values.remove(at);
+    if let Some(value) = set.remove(object as CFTypeRef) {
         set.policy.release(value);
     }
 }
@@ -2788,11 +2770,6 @@ unsafe extern "C" fn set_minus(receiver: Id, sel: Sel, other: Id) {
     }
 }
 
-/// Whether `set` holds a member equal to `value`, by the set's own equality.
-fn set_holds(set: &collections::SetContents, value: CFTypeRef) -> bool {
-    set.values.iter().any(|v| set.policy.equal(*v, value))
-}
-
 unsafe extern "C" fn set_intersect(receiver: Id, _sel: Sel, other: Id) {
     // SAFETY: a set or an array.
     let others = unsafe { members_of(other) };
@@ -2800,13 +2777,20 @@ unsafe extern "C" fn set_intersect(receiver: Id, _sel: Sel, other: Id) {
     let Some(set) = (unsafe { collections::set(receiver as CFTypeRef) }) else {
         return;
     };
-    let policy = set.policy;
-    let (kept, dropped): (Vec<CFTypeRef>, Vec<CFTypeRef>) = std::mem::take(&mut set.values)
-        .into_iter()
-        .partition(|v| others.iter().any(|o| policy.equal(*v, *o)));
-    set.values = kept;
+    let mut kept = collections::SetContents::new(set.policy);
+    for value in others {
+        kept.insert(value);
+    }
+    let dropped: Vec<CFTypeRef> = set
+        .values()
+        .iter()
+        .copied()
+        .filter(|value| !kept.contains(*value))
+        .collect();
     for value in dropped {
-        policy.release(value);
+        if let Some(value) = set.remove(value) {
+            set.policy.release(value);
+        }
     }
 }
 
@@ -2817,7 +2801,7 @@ unsafe extern "C" fn set_intersects(receiver: Id, _sel: Sel, other: Id) -> u8 {
     }) else {
         return 0;
     };
-    others.iter().any(|o| set_holds(set, *o)) as u8
+    others.iter().any(|o| set.contains(*o)) as u8
 }
 
 unsafe extern "C" fn set_is_subset(receiver: Id, _sel: Sel, other: Id) -> u8 {
@@ -2829,15 +2813,15 @@ unsafe extern "C" fn set_is_subset(receiver: Id, _sel: Sel, other: Id) -> u8 {
     else {
         return 0;
     };
-    set.values.iter().all(|v| set_holds(superset, *v)) as u8
+    set.values().iter().all(|v| superset.contains(*v)) as u8
 }
 
 unsafe extern "C" fn set_is_equal_to_set(receiver: Id, sel: Sel, other: Id) -> u8 {
     // SAFETY: two sets, or nil.
     let counts = unsafe {
         (
-            collections::set(receiver as CFTypeRef).map(|s| s.values.len()),
-            collections::set(other as CFTypeRef).map(|s| s.values.len()),
+            collections::set(receiver as CFTypeRef).map(|s| s.len()),
+            collections::set(other as CFTypeRef).map(|s| s.len()),
         )
     };
     // SAFETY: as `-isSubsetOfSet:`.
@@ -2849,7 +2833,7 @@ unsafe extern "C" fn set_is_equal_to_set(receiver: Id, sel: Sel, other: Id) -> u
 unsafe extern "C" fn set_remove_all(receiver: Id, _sel: Sel) {
     // SAFETY: a set.
     if let Some(set) = unsafe { collections::set(receiver as CFTypeRef) } {
-        for value in std::mem::take(&mut set.values) {
+        for value in set.take_all() {
             set.policy.release(value);
         }
     }
@@ -2858,7 +2842,7 @@ unsafe extern "C" fn set_remove_all(receiver: Id, _sel: Sel) {
 unsafe extern "C" fn set_any_object(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: a set.
     unsafe { collections::set(receiver as CFTypeRef) }
-        .and_then(|set| set.values.first().copied())
+        .and_then(|set| set.values().first().copied())
         .map_or(std::ptr::null_mut(), |value| value as Id)
 }
 
@@ -2875,7 +2859,7 @@ unsafe extern "C" fn set_enumerate(
     };
     // SAFETY: the guest's own state structure, and storage that outlives the
     // loop.
-    unsafe { enumerate(state, &mut set.values) }
+    unsafe { enumerate(state, set.values()) }
 }
 
 pub(crate) fn install() {
@@ -2912,6 +2896,7 @@ pub(crate) fn install() {
     });
     let mutable_set = objc::class::lookup(c"NSMutableSet").expect("NSMutableSet");
     methods!(mutable_set, {
+        "initWithCapacity:" => init_mutable_set_with_capacity, c"@24@0:8Q16";
         "addObject:" => set_add_object, c"v24@0:8@16";
         "addObjectsFromArray:" => set_add_objects, c"v24@0:8@16";
         "unionSet:" => set_add_objects, c"v24@0:8@16";
@@ -3199,6 +3184,23 @@ mod tests {
     }
 
     #[test]
+    fn mutable_set_init_with_capacity_answers_a_usable_set() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSMutableSet").expect("NSMutableSet");
+        let placeholder = objc::object::create_instance(class, 0);
+        // SAFETY: a fresh NSMutableSet placeholder, owned here.
+        let set = unsafe {
+            init_mutable_set_with_capacity(placeholder, objc::sel::get("initWithCapacity:"), 4)
+        };
+        let member = crate::string::from_str("member");
+        // SAFETY: `set` is a live set and `member` a live object.
+        unsafe {
+            set_add_object(set, objc::sel::get("addObject:"), member);
+            assert_eq!(set_count(set, objc::sel::get("count")), 1);
+        }
+    }
+
+    #[test]
     fn sort_using_comparator_orders_a_mutable_array_in_place() {
         crate::bootstrap();
         unsafe extern "C" fn compare(_block: Id, a: Id, b: Id) -> isize {
@@ -3218,6 +3220,22 @@ mod tests {
         for string in strings {
             objc::arc::release(string as Id);
         }
+    }
+
+    /// The buffer is on the stack, so freeing it would abort the test.
+    #[test]
+    fn data_with_bytes_no_copy_leaves_the_buffer_unless_free_when_done() {
+        crate::bootstrap();
+        let source = [1u8, 2, 3];
+        let pool = objc::arc::pool_push();
+        let sel = objc::sel::get("dataWithBytesNoCopy:length:freeWhenDone:");
+        // SAFETY: `source` covers the stated length and stays the caller's.
+        let data = unsafe {
+            data_with_bytes_no_copy_free(std::ptr::null_mut(), sel, source.as_ptr(), 3, 0)
+        };
+        // SAFETY: a data object this test made.
+        assert_eq!(unsafe { data_contents(data) }, source);
+        objc::arc::pool_pop(pool);
     }
 
     #[test]
@@ -3249,6 +3267,64 @@ mod tests {
             ));
         }
         for object in [copy, set, a, b] {
+            objc::arc::release(object);
+        }
+    }
+
+    #[test]
+    fn set_with_objects_keeps_one_of_each_equal_string() {
+        crate::bootstrap();
+        let members = [
+            crate::string::from_str("a"),
+            crate::string::from_str("b"),
+            crate::string::from_str("a"),
+        ];
+        // SAFETY: a live slice of three strings.
+        let set = unsafe {
+            set_with_objects_count(
+                std::ptr::null_mut(),
+                objc::sel::get("setWithObjects:count:"),
+                members.as_ptr(),
+                members.len(),
+            )
+        };
+        let probe = crate::string::from_str("a");
+        // SAFETY: a set and live strings.
+        unsafe {
+            assert_eq!(set_count(set, objc::sel::get("count")), 2);
+            assert_eq!(
+                set_member(set, objc::sel::get("member:"), probe),
+                members[0]
+            );
+            set_remove_object(set, objc::sel::get("removeObject:"), probe);
+            assert_eq!(set_count(set, objc::sel::get("count")), 1);
+            assert!(set_member(set, objc::sel::get("member:"), probe).is_null());
+        }
+        for object in members.into_iter().chain([probe]) {
+            objc::arc::release(object);
+        }
+    }
+
+    #[test]
+    fn intersecting_a_set_keeps_the_members_the_other_holds() {
+        crate::bootstrap();
+        let [a, b, c] = ["a", "b", "c"].map(crate::string::from_str);
+        let set = collections::new_set(
+            &[a as CFTypeRef, b as CFTypeRef, c as CFTypeRef],
+            Policy::from_type_callbacks(),
+        ) as Id;
+        let other_b = crate::string::from_str("b");
+        let others = collections::new_array(
+            &[other_b as CFTypeRef],
+            Policy::from_type_callbacks(),
+            false,
+        ) as Id;
+        // SAFETY: a mutable set and an array.
+        unsafe { set_intersect(set, objc::sel::get("intersectSet:"), others) };
+        // SAFETY: a set.
+        let members = unsafe { collections::set(set as CFTypeRef) }.expect("a set");
+        assert_eq!(members.values(), &[b as CFTypeRef]);
+        for object in [set, others, a, b, c, other_b] {
             objc::arc::release(object);
         }
     }

@@ -71,6 +71,16 @@ impl Drop for State {
 
 static STATE: OnceLock<Result<State, String>> = OnceLock::new();
 
+/// Write out the pipeline cache of every device opened so far.
+pub(crate) fn save_pipeline_caches() {
+    let Some(Ok(state)) = STATE.get() else {
+        return;
+    };
+    for gpu in state.adapters.iter().filter_map(Adapter::opened_gpu) {
+        gpu.save_pipeline_cache();
+    }
+}
+
 pub fn adapters() -> Result<&'static [Adapter], &'static str> {
     match STATE.get_or_init(initialize) {
         Ok(state) => Ok(&state.adapters),
@@ -678,15 +688,21 @@ mod tests {
         device_type: vk::PhysicalDeviceType,
         image_dimension: u32,
     ) -> vk::PhysicalDeviceProperties {
-        let mut properties = vk::PhysicalDeviceProperties::default();
-        properties.device_type = device_type;
-        properties.limits.max_image_dimension2_d = image_dimension;
-        properties
+        vk::PhysicalDeviceProperties {
+            device_type,
+            limits: vk::PhysicalDeviceLimits {
+                max_image_dimension2_d: image_dimension,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     fn memory(device_local: u64) -> vk::PhysicalDeviceMemoryProperties {
-        let mut memory = vk::PhysicalDeviceMemoryProperties::default();
-        memory.memory_heap_count = 1;
+        let mut memory = vk::PhysicalDeviceMemoryProperties {
+            memory_heap_count: 1,
+            ..Default::default()
+        };
         memory.memory_heaps[0].size = device_local;
         memory.memory_heaps[0].flags = vk::MemoryHeapFlags::DEVICE_LOCAL;
         memory

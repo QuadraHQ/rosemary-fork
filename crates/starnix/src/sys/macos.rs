@@ -9,6 +9,8 @@ pub mod memory {
 
     pub use crate::memory::named::object;
 
+    pub const NORESERVE: libc::c_int = libc::MAP_NORESERVE;
+
     pub fn exclude_from_fork(address: usize, len: usize) -> std::io::Result<()> {
         unsafe extern "C" {
             fn minherit(address: *mut core::ffi::c_void, len: usize, flags: u32) -> i32;
@@ -404,6 +406,12 @@ pub fn regions(pid: i32) -> io::Result<Vec<Region>> {
 /// that asks; nothing here needs to stand in for them.
 pub fn audit() -> Audit {
     Audit::default()
+}
+
+// `p_comm` is copied from the executable at `exec` and nothing changes it
+// after.
+pub fn set_name(_name: &CStr) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
 }
 
 fn host() -> libc::mach_port_t {

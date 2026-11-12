@@ -26,10 +26,10 @@ pub struct View {
     allowed_touch_types: usize,
     frame: NSRect,
     wants_best_resolution: usize,
-    /// `-setPostsFrameChangedNotifications:` and its bounds twin, as the two
-    /// low bits. A view posts nothing until it is asked to, which is AppKit's
-    /// default for a view built with `-initWithFrame:`.
-    posts: usize,
+    /// `-setPostsFrameChangedNotifications:NO` and its bounds twin, as the two
+    /// low bits. Stored inverted: a view posts both until it is told not to,
+    /// which is AppKit's default, so zero means posting.
+    quiet: usize,
     /// `NSAutoresizingMaskOptions`, which says which of the six lengths around
     /// and inside this view give when its superview resizes. See
     /// [`resize_subviews`].
@@ -1028,44 +1028,44 @@ fn visit_metal_scene(
     }
     if has_ca_mask {
         let radius = crate::coreanimation::scene_corner_radius(layer);
-        if radius > 0.0 {
-            if let Some(frame) = own_frame {
-                let bounds = bounds_of(view).size;
-                let scale_x = f64::from(frame.width) / bounds.width.abs().max(f64::MIN_POSITIVE);
-                let scale_y = f64::from(frame.height) / bounds.height.abs().max(f64::MIN_POSITIVE);
-                let physical = radius * scale_x.min(scale_y);
-                if physical.is_finite() && physical > 0.0 {
-                    rounded.push(RoundedSceneClip {
-                        frame,
-                        radius: physical as f32,
-                    });
-                }
+        if radius > 0.0
+            && let Some(frame) = own_frame
+        {
+            let bounds = bounds_of(view).size;
+            let scale_x = f64::from(frame.width) / bounds.width.abs().max(f64::MIN_POSITIVE);
+            let scale_y = f64::from(frame.height) / bounds.height.abs().max(f64::MIN_POSITIVE);
+            let physical = radius * scale_x.min(scale_y);
+            if physical.is_finite() && physical > 0.0 {
+                rounded.push(RoundedSceneClip {
+                    frame,
+                    radius: physical as f32,
+                });
             }
         }
     }
-    if !layer.is_null() && crate::layer::is_metal(layer) {
-        if let Some(frame) = unsafe { presentation_frame(view) } {
-            if frame.window == window {
-                scene.push(MetalSceneLayer {
-                    opacity_groups: opacity_groups.clone(),
-                    layer: layer as usize,
-                    frame,
-                    opacity: source_view_alpha * layer_opacity,
-                    opaque: crate::layer::opaque_of(layer),
-                    clip: ca_clip,
-                    rounded: rounded.clone(),
-                    occluded: Vec::new(),
-                    native_pixels: None,
-                    native_tiles: None,
-                    native_cpu_capture: None,
-                    native_dmabuf: None,
-                    native_revision: 0,
-                    native_dma_sample: None,
-                    native_owner: 0,
-                });
-                *seen_metal = true;
-            }
-        }
+    if !layer.is_null()
+        && crate::layer::is_metal(layer)
+        && let Some(frame) = unsafe { presentation_frame(view) }
+        && frame.window == window
+    {
+        scene.push(MetalSceneLayer {
+            opacity_groups: opacity_groups.clone(),
+            layer: layer as usize,
+            frame,
+            opacity: source_view_alpha * layer_opacity,
+            opaque: crate::layer::opaque_of(layer),
+            clip: ca_clip,
+            rounded: rounded.clone(),
+            occluded: Vec::new(),
+            native_pixels: None,
+            native_tiles: None,
+            native_cpu_capture: None,
+            native_dmabuf: None,
+            native_revision: 0,
+            native_dma_sample: None,
+            native_owner: 0,
+        });
+        *seen_metal = true;
     }
     let child_clip = if current_masks {
         own_frame.map(|frame| ca_clip.map_or(frame, |clip| intersect_scene_clips(frame, clip)))
@@ -1144,133 +1144,126 @@ fn visit_metal_scene(
     // Per-view native content needs its own source above the preceding
     // drawable. The high bit reserves an identity namespace distinct from
     // user-space Objective-C layer pointers and SDL window identities.
-    if *seen_metal && (layer.is_null() || !crate::layer::is_metal(layer)) {
-        if let Some(frame) = unsafe { presentation_frame(view) } {
-            if frame.window == window {
-                // A 6K NSView clipped into a small Metal window only needs
-                // that visible rectangle in GPU memory. Preserve source-local
-                // coordinates while publishing the cropped frame in window
-                // pixels; Metal never gets the flattened-underlay version.
-                let viewport = Frame {
-                    x: 0,
-                    y: 0,
-                    width: frame.window_width,
-                    height: frame.window_height,
-                    ..frame
+    if *seen_metal
+        && (layer.is_null() || !crate::layer::is_metal(layer))
+        && let Some(frame) = unsafe { presentation_frame(view) }
+        && frame.window == window
+    {
+        // A 6K NSView clipped into a small Metal window only needs
+        // that visible rectangle in GPU memory. Preserve source-local
+        // coordinates while publishing the cropped frame in window
+        // pixels; Metal never gets the flattened-underlay version.
+        let viewport = Frame {
+            x: 0,
+            y: 0,
+            width: frame.window_width,
+            height: frame.window_height,
+            ..frame
+        };
+        let visible = ca_clip.map_or(intersect_scene_clips(frame, viewport), |clip| {
+            intersect_scene_clips(intersect_scene_clips(frame, viewport), clip)
+        });
+        let dma = crate::backing::native_scene_dma_extent_supported(frame.width, frame.height)
+            .then(|| crate::backing::native_dma_overlay(view))
+            .flatten();
+        // The 64 MiB capture bound applies to one allocation, not an
+        // entire visible NSView. Publish 2048x2048 pixel tiles in the
+        // same paint order, each with an independent GPU lease.
+        let large_visible =
+            !crate::backing::native_scene_extent_supported(visible.width, visible.height);
+        let tiled_candidate = dma.is_none()
+            && crate::backing::native_scene_tiled_candidate(view, frame.width, frame.height);
+        let tile_edge = if large_visible { 2048 } else { u32::MAX };
+        let mut index = 0u32;
+        let mut y = 0u32;
+        while y < visible.height {
+            let height = (visible.height - y).min(tile_edge);
+            let mut x = 0u32;
+            while x < visible.width {
+                let width = (visible.width - x).min(tile_edge);
+                let part = Frame {
+                    x: visible.x.saturating_add(x as i32),
+                    y: visible.y.saturating_add(y as i32),
+                    width,
+                    height,
+                    ..visible
                 };
-                let visible = ca_clip.map_or(intersect_scene_clips(frame, viewport), |clip| {
-                    intersect_scene_clips(intersect_scene_clips(frame, viewport), clip)
-                });
-                let dma =
-                    crate::backing::native_scene_dma_extent_supported(frame.width, frame.height)
-                        .then(|| crate::backing::native_dma_overlay(view))
-                        .flatten();
-                // The 64 MiB capture bound applies to one allocation, not an
-                // entire visible NSView. Publish 2048x2048 pixel tiles in the
-                // same paint order, each with an independent GPU lease.
-                let large_visible =
-                    !crate::backing::native_scene_extent_supported(visible.width, visible.height);
-                let tiled_candidate = dma.is_none()
-                    && crate::backing::native_scene_tiled_candidate(
+                let cropped = crate::backing::Rect {
+                    x: i64::from(part.x) - i64::from(frame.x),
+                    y: i64::from(part.y) - i64::from(frame.y),
+                    width: i64::from(width),
+                    height: i64::from(height),
+                };
+                let tiled = if tiled_candidate {
+                    crate::backing::native_scene_tiled_pixels_cropped_with_damage(
                         view,
                         frame.width,
                         frame.height,
-                    );
-                let tile_edge = if large_visible { 2048 } else { u32::MAX };
-                let mut index = 0u32;
-                let mut y = 0u32;
-                while y < visible.height {
-                    let height = (visible.height - y).min(tile_edge);
-                    let mut x = 0u32;
-                    while x < visible.width {
-                        let width = (visible.width - x).min(tile_edge);
-                        let part = Frame {
-                            x: visible.x.saturating_add(x as i32),
-                            y: visible.y.saturating_add(y as i32),
-                            width,
-                            height,
-                            ..visible
-                        };
-                        let cropped = crate::backing::Rect {
-                            x: i64::from(part.x) - i64::from(frame.x),
-                            y: i64::from(part.y) - i64::from(frame.y),
-                            width: i64::from(width),
-                            height: i64::from(height),
-                        };
-                        let tiled = if tiled_candidate {
-                            crate::backing::native_scene_tiled_pixels_cropped_with_damage(
-                                view,
-                                frame.width,
-                                frame.height,
-                                cropped,
-                            )
-                        } else {
-                            None
-                        };
-                        let cpu = if tiled.is_some() {
-                            None
-                        } else {
-                            crate::backing::native_scene_pixels_cropped_with_damage(
-                                view,
-                                frame.width,
-                                frame.height,
-                                cropped,
-                            )
-                        };
-                        // A DMA source remains one coherent GPU image. A CPU
-                        // tile never borrows a DMA producer's unrelated frame.
-                        if cpu.is_some() || tiled.is_some() || dma.is_some() {
-                            let sample = dma.as_ref().map(|_| {
-                                (
-                                    frame.width,
-                                    frame.height,
-                                    cropped.x as u32,
-                                    cropped.y as u32,
-                                )
-                            });
-                            // Moving a large static DMA view can keep the
-                            // visible output frame unchanged while changing
-                            // which producer texels are sampled.
-                            let revision = cpu.as_ref().map_or(0, |(_, rev, _)| *rev)
-                                ^ tiled.as_ref().map_or(0, |(_, rev, _)| *rev)
-                                ^ dma.as_ref().map_or(0, |(_, rev)| rev.rotate_left(19))
-                                ^ sample.map_or(0, |(w, h, x, y)| {
-                                    (u64::from(w) << 32 | u64::from(h)).rotate_left(11)
-                                        ^ (u64::from(x) << 32 | u64::from(y)).rotate_left(37)
-                                });
-                            scene.push(MetalSceneLayer {
-                                opacity_groups: opacity_groups.clone(),
-                                layer: native_tile_id(view, index),
-                                native_owner: view as usize,
-                                frame: part,
-                                opacity: source_view_alpha * layer_opacity,
-                                opaque: false,
-                                clip: ca_clip,
-                                rounded: rounded.clone(),
-                                occluded: Vec::new(),
-                                native_cpu_capture: cpu
-                                    .as_ref()
-                                    .map(|(_, rev, damage)| (*rev, *damage))
-                                    .or_else(|| {
-                                        tiled.as_ref().map(|(_, rev, damage)| (*rev, *damage))
-                                    })
-                                    .map(|(revision, damage)| crate::backing::NativeCpuCapture {
-                                        revision,
-                                        damage,
-                                    }),
-                                native_pixels: cpu.map(|(pixels, _, _)| pixels),
-                                native_tiles: tiled.map(|(tiles, _, _)| tiles),
-                                native_dmabuf: dma.as_ref().map(|(p, _)| std::sync::Arc::clone(p)),
-                                native_dma_sample: sample,
-                                native_revision: revision,
-                            });
-                        }
-                        index += 1;
-                        x += width;
-                    }
-                    y += height;
+                        cropped,
+                    )
+                } else {
+                    None
+                };
+                let cpu = if tiled.is_some() {
+                    None
+                } else {
+                    crate::backing::native_scene_pixels_cropped_with_damage(
+                        view,
+                        frame.width,
+                        frame.height,
+                        cropped,
+                    )
+                };
+                // A DMA source remains one coherent GPU image. A CPU
+                // tile never borrows a DMA producer's unrelated frame.
+                if cpu.is_some() || tiled.is_some() || dma.is_some() {
+                    let sample = dma.as_ref().map(|_| {
+                        (
+                            frame.width,
+                            frame.height,
+                            cropped.x as u32,
+                            cropped.y as u32,
+                        )
+                    });
+                    // Moving a large static DMA view can keep the
+                    // visible output frame unchanged while changing
+                    // which producer texels are sampled.
+                    let revision = cpu.as_ref().map_or(0, |(_, rev, _)| *rev)
+                        ^ tiled.as_ref().map_or(0, |(_, rev, _)| *rev)
+                        ^ dma.as_ref().map_or(0, |(_, rev)| rev.rotate_left(19))
+                        ^ sample.map_or(0, |(w, h, x, y)| {
+                            (u64::from(w) << 32 | u64::from(h)).rotate_left(11)
+                                ^ (u64::from(x) << 32 | u64::from(y)).rotate_left(37)
+                        });
+                    scene.push(MetalSceneLayer {
+                        opacity_groups: opacity_groups.clone(),
+                        layer: native_tile_id(view, index),
+                        native_owner: view as usize,
+                        frame: part,
+                        opacity: source_view_alpha * layer_opacity,
+                        opaque: false,
+                        clip: ca_clip,
+                        rounded: rounded.clone(),
+                        occluded: Vec::new(),
+                        native_cpu_capture: cpu
+                            .as_ref()
+                            .map(|(_, rev, damage)| (*rev, *damage))
+                            .or_else(|| tiled.as_ref().map(|(_, rev, damage)| (*rev, *damage)))
+                            .map(|(revision, damage)| crate::backing::NativeCpuCapture {
+                                revision,
+                                damage,
+                            }),
+                        native_pixels: cpu.map(|(pixels, _, _)| pixels),
+                        native_tiles: tiled.map(|(tiles, _, _)| tiles),
+                        native_dmabuf: dma.as_ref().map(|(p, _)| std::sync::Arc::clone(p)),
+                        native_dma_sample: sample,
+                        native_revision: revision,
+                    });
                 }
+                index += 1;
+                x += width;
             }
+            y += height;
         }
     }
     for child in child_views {
@@ -1329,10 +1322,10 @@ fn publish_metal_scene_at(sdl: sdl3::Window, now: f64, force: bool) {
     let differs = changed
         .as_ref()
         .is_none_or(|old| !same_metal_scene(old, &scene));
-    if differs || force {
-        if let Some(hook) = METAL_SCENE_CHANGED.get() {
-            hook(sdl, scene);
-        }
+    if (differs || force)
+        && let Some(hook) = METAL_SCENE_CHANGED.get()
+    {
+        hook(sdl, scene);
     }
 }
 
@@ -1408,11 +1401,11 @@ fn note_geometry_change(receiver: Id, before: NSRect) {
     }
     crate::layout::solve();
     let view = view_of(receiver);
-    let posts = view.posts;
-    if posts & POSTS_FRAME != 0 {
+    let quiet = view.quiet;
+    if quiet & POSTS_FRAME == 0 {
         foundation::notification::post(FRAME_DID_CHANGE, receiver, std::ptr::null_mut());
     }
-    if posts & POSTS_BOUNDS != 0 && view.frame.size != before.size {
+    if quiet & POSTS_BOUNDS == 0 && view.frame.size != before.size {
         foundation::notification::post(BOUNDS_DID_CHANGE, receiver, std::ptr::null_mut());
     }
     // Moving or resizing the focused editor also moves the host IME UI.
@@ -1636,18 +1629,18 @@ unsafe extern "C" fn set_posts_bounds_changed(receiver: Id, _sel: Sel, flag: u8)
 
 fn set_posts(receiver: Id, bit: usize, flag: u8) {
     let view = view_of(receiver);
-    view.posts = match flag != 0 {
-        true => view.posts | bit,
-        false => view.posts & !bit,
+    view.quiet = match flag != 0 {
+        true => view.quiet & !bit,
+        false => view.quiet | bit,
     };
 }
 
 unsafe extern "C" fn posts_frame_changed(receiver: Id, _sel: Sel) -> u8 {
-    u8::from(view_of(receiver).posts & POSTS_FRAME != 0)
+    u8::from(view_of(receiver).quiet & POSTS_FRAME == 0)
 }
 
 unsafe extern "C" fn posts_bounds_changed(receiver: Id, _sel: Sel) -> u8 {
-    u8::from(view_of(receiver).posts & POSTS_BOUNDS != 0)
+    u8::from(view_of(receiver).quiet & POSTS_BOUNDS == 0)
 }
 
 /// `-setLayer:`, which stores the layer and points it back at this view.
@@ -2243,6 +2236,69 @@ pub unsafe fn presentation_frame(view: Id) -> Option<Frame> {
     Some(frame)
 }
 
+/// The part of a view its ancestors and its window leave on screen, in the
+/// window pixels [`presentation_frame`] answers `frame` in; empty when none of
+/// it is.
+///
+/// AppKit draws only this part: a document view thousands of lines tall
+/// inside a clip view is asked for the lines that show.
+///
+/// # Safety
+///
+/// `view` is null or a view of this crate's, and `frame` is its frame.
+pub unsafe fn presentation_visible(view: Id, frame: &Frame) -> sdl3::Rect {
+    let empty = sdl3::Rect {
+        x: frame.x,
+        y: frame.y,
+        w: 0,
+        h: 0,
+    };
+    if !is_view(view) {
+        return empty;
+    }
+    // SAFETY: the caller's obligation, checked above.
+    let window = unsafe { window_of(view) };
+    let Some(snapshot) = sdl3::video::presentation_window(frame.window) else {
+        return empty;
+    };
+    let mut visible = rect_in_window(view);
+    let mut node = view_of(view).superview;
+    for _ in 0..64 {
+        if !is_view(node) {
+            break;
+        }
+        visible = intersection(visible, rect_in_window(node));
+        node = view_of(node).superview;
+    }
+    if visible.size.width <= 0.0 || visible.size.height <= 0.0 {
+        return empty;
+    }
+    let Some(mapped) = crate::window::rect_to_surface(window, visible) else {
+        return empty;
+    };
+    let pixels =
+        crate::window::pixel_rect_from_surface(mapped, snapshot.logical_size, snapshot.pixel_size);
+    // Rounded the way the frame is, so its edges are the frame's where they
+    // coincide; then kept inside both the frame and the window.
+    let x0 = pixels.x.max(frame.x).max(0);
+    let y0 = pixels.y.max(frame.y).max(0);
+    let x1 = (pixels.x + pixels.w)
+        .min(frame.x + frame.width as i32)
+        .min(frame.window_width as i32);
+    let y1 = (pixels.y + pixels.h)
+        .min(frame.y + frame.height as i32)
+        .min(frame.window_height as i32);
+    if x0 >= x1 || y0 >= y1 {
+        return empty;
+    }
+    sdl3::Rect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    }
+}
+
 /// The view's rectangle in SDL's logical window coordinates.
 ///
 /// This is deliberately not [`presentation_frame`]: SDL text-input areas are
@@ -2341,6 +2397,9 @@ unsafe fn hit(view: Id, point: NSPoint, depth: usize) -> Id {
 /// The inherited `NSView` hit-test behavior, without redispatching an override
 /// on `view`. This distinction matters when that override calls `super`.
 unsafe fn hit_base(view: Id, point: NSPoint, depth: usize) -> Id {
+    if view_of(view).hidden != 0 {
+        return std::ptr::null_mut();
+    }
     let frame = view_of(view).frame;
     let superview = view_of(view).superview;
     if !crate::geometry::mouse_in_rect(point, frame, is_flipped(superview)) {
@@ -2588,7 +2647,7 @@ pub(crate) unsafe extern "C" fn set_bounds_origin(receiver: Id, _sel: Sel, origi
         crate::layer::set_bounds_of(layer, bounds_of(receiver));
     }
     crate::backing::needs_display(receiver);
-    if view_of(receiver).posts & POSTS_BOUNDS != 0 {
+    if view_of(receiver).quiet & POSTS_BOUNDS == 0 {
         foundation::notification::post(BOUNDS_DID_CHANGE, receiver, std::ptr::null_mut());
     }
 }
@@ -3694,6 +3753,16 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_subview_takes_no_clicks() {
+        let (superview, subview) = tree(rect(0.0, 0.0, 10.0, 10.0), rect(0.0, 0.0, 5.0, 5.0), 0);
+        let point = NSPoint { x: 2.0, y: 2.0 };
+        assert_eq!(unsafe { hit_test(superview, point) }, subview);
+        view_of(subview).hidden = 1;
+        assert_eq!(unsafe { hit_test(superview, point) }, superview);
+        objc::arc::release(superview);
+    }
+
+    #[test]
     fn a_freed_superview_leaves_its_retained_subview_detached() {
         let (superview, subview) = tree(rect(0.0, 0.0, 10.0, 10.0), rect(0.0, 0.0, 5.0, 5.0), 0);
         objc::arc::retain(subview);
@@ -4447,7 +4516,7 @@ mod tests {
             .expect("non-view CALayer child missing above Metal drawable");
         assert_eq!(native.native_owner, metal_view as usize);
         let before = native.native_pixels.as_ref().unwrap();
-        assert!(before.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        assert!(before.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0));
         let full = crate::backing::metal_sublayers_pixels_cropped(
             metal_view,
             100,
@@ -4462,7 +4531,7 @@ mod tests {
         .expect("full retained CA raster")
         .0;
         assert!(
-            full.chunks_exact(4).any(|pixel| pixel[3] == 0),
+            full.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 0),
             "root Metal background must not be rasterized over its drawable"
         );
         let original_revision = native.native_revision;
@@ -4516,7 +4585,9 @@ mod tests {
             .native_pixels
             .as_ref()
             .unwrap()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|pixel| pixel[3])
             .max()
             .unwrap();
@@ -4598,7 +4669,9 @@ mod tests {
                 .native_pixels
                 .as_ref()
                 .unwrap()
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|px| px[3] > 0)
         );
         unsafe {
@@ -4704,18 +4777,20 @@ mod tests {
                 .map(|item| item.native_owner)
                 .collect::<Vec<_>>();
             assert_eq!(owners, expected);
-            let colors = scene
+
+            scene
                 .iter()
                 .skip(1)
                 .filter_map(|item| item.native_pixels.as_ref())
                 .map(|data| {
-                    data.chunks_exact(4)
+                    data.as_chunks::<4>()
+                        .0
+                        .iter()
                         .find(|p| p[3] == 255)
                         .map(|pixel| pixel.to_vec())
                         .unwrap()
                 })
-                .collect::<Vec<_>>();
-            colors
+                .collect::<Vec<_>>()
         };
         assert_eq!(
             verify(&[metal_view as usize, blue_view as usize, metal_view as usize]),
@@ -4838,7 +4913,9 @@ mod tests {
                 .native_pixels
                 .as_ref()
                 .unwrap()
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .find(|px| px[3] != 0)
                 .unwrap();
             assert_eq!(pixel[3], 255, "CPU capture premultiplied GPU group alpha");
@@ -5091,7 +5168,7 @@ mod tests {
         unsafe { set(ca, objc::sel::get("setBackgroundColor:"), opaque as Id) };
         let image = crate::backing::native_scene_pixels(large, 3840, 2160)
             .expect("a changed opaque CA layer must invalidate empty cache");
-        assert!(image.0.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        assert!(image.0.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0));
         assert_eq!(crate::backing::native_render_count_for_tests() - before, 2);
         unsafe { set(ca, objc::sel::get("setBackgroundColor:"), transparent as Id) };
         assert!(crate::backing::native_scene_pixels(large, 3840, 2160).is_none());
@@ -7223,6 +7300,124 @@ mod tests {
 }
 
 #[cfg(test)]
+mod visible_part_drawing {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
+        NSRect {
+            origin: NSPoint { x, y },
+            size: NSSize { width, height },
+        }
+    }
+
+    static ASKED: Mutex<Vec<NSRect>> = Mutex::new(Vec::new());
+
+    unsafe extern "C" fn record_draw_rect(_receiver: Id, _sel: Sel, dirty: NSRect) {
+        ASKED.lock().unwrap().push(dirty);
+        crate::color::NSRectFill(dirty);
+    }
+
+    fn send_rect(receiver: Id, name: &str, value: NSRect) {
+        // SAFETY: `void (id, SEL, NSRect)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect) = std::mem::transmute(objc::msg::entry());
+            f(receiver, objc::sel::get(name), value);
+        }
+    }
+
+    /// A view taller than what holds it is asked for, and stores, only the
+    /// part that shows, and the part that shows after a scroll.
+    #[test]
+    fn a_tall_view_draws_only_the_part_that_shows() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        // SAFETY: a fresh window.
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0., 0., 160., 120.))
+        } {
+            return;
+        }
+        let new_view = |class: &'static objc::class::Class, frame: NSRect| unsafe {
+            init_with_frame(
+                objc::object::create_instance(class, 0),
+                objc::sel::get("initWithFrame:"),
+                frame,
+            )
+        };
+        let content = new_view(
+            objc::class::lookup(c"NSView").unwrap(),
+            rect(0., 0., 160., 120.),
+        );
+        // SAFETY: `void (id, SEL, id)`.
+        let send_id: unsafe extern "C" fn(Id, Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { send_id(window, objc::sel::get("setContentView:"), content) };
+        let class = objc::class::lookup(c"RosemaryVisiblePartTestView").unwrap_or_else(|| {
+            let class = objc::class::allocate_pair(
+                objc::class::lookup(c"NSView"),
+                c"RosemaryVisiblePartTestView",
+                0,
+            )
+            .unwrap();
+            assert!(class.add_method(
+                objc::sel::get("drawRect:"),
+                record_draw_rect as objc::class::Imp,
+                c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16"
+            ));
+            objc::class::register_pair(class);
+            class
+        });
+        let tall = new_view(class, rect(10., 10., 40., 1000.));
+        unsafe { send_id(content, objc::sel::get("addSubview:"), tall) };
+        let density = crate::backing::focus_density_of_for_tests(tall);
+
+        ASKED.lock().unwrap().clear();
+        crate::backing::display_view(tall);
+        assert_eq!(*ASKED.lock().unwrap(), [rect(0., 0., 40., 110.)]);
+        let held = crate::backing::view_store_geometry_for_tests(tall).unwrap();
+        assert_eq!(held.1.1 as f64, (110. * density).round());
+
+        send_rect(content, "setBounds:", rect(0., 500., 160., 120.));
+        ASKED.lock().unwrap().clear();
+        crate::backing::display_view(tall);
+        assert_eq!(*ASKED.lock().unwrap(), [rect(0., 490., 40., 120.)]);
+        let moved = crate::backing::view_store_geometry_for_tests(tall).unwrap();
+        assert_eq!(moved.1.1 as f64, (120. * density).round());
+        assert_ne!(moved.0, held.0, "the store moved with the part that shows");
+        objc::arc::release(window);
+    }
+
+    /// AppKit's default: a view posts both notifications until told not to.
+    #[test]
+    fn a_view_posts_frame_and_bounds_changes_by_default() {
+        crate::bootstrap();
+        let view = unsafe {
+            init_with_frame(
+                objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0),
+                objc::sel::get("initWithFrame:"),
+                rect(0., 0., 10., 10.),
+            )
+        };
+        let sel = objc::sel::get("");
+        // SAFETY: a view made above.
+        unsafe {
+            assert_eq!(posts_frame_changed(view, sel), 1);
+            assert_eq!(posts_bounds_changed(view, sel), 1);
+            set_posts_bounds_changed(view, sel, 0);
+            assert_eq!(posts_bounds_changed(view, sel), 0);
+            assert_eq!(posts_frame_changed(view, sel), 1);
+        }
+    }
+}
+
+#[cfg(test)]
 mod native_partial_draw_regression {
     use super::*;
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -7251,7 +7446,7 @@ mod native_partial_draw_regression {
         match DRAW_PHASE.load(Ordering::Relaxed) {
             0 => {
                 assert!(crate::backing::draw_focused(|pixels, width, height| {
-                    for pixel in pixels.chunks_exact_mut(4) {
+                    for pixel in pixels.as_chunks_mut::<4>().0 {
                         pixel.copy_from_slice(&[255, 0, 0, 255]);
                     }
                     Some(crate::backing::Rect {

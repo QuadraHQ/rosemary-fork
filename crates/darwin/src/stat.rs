@@ -493,14 +493,40 @@ pub unsafe extern "C" fn readlink(
     buffer: *mut c_char,
     size: libc::size_t,
 ) -> libc::ssize_t {
+    unsafe { readlinkat(DARWIN_AT_FDCWD, path, buffer, size) }
+}
+
+/// `ssize_t readlinkat(int fd, const char *, char *, size_t)`, as [`readlink`].
+///
+/// # Safety
+///
+/// As [`readlink`], and `dirfd` is a directory descriptor or Darwin's
+/// `AT_FDCWD`.
+pub unsafe extern "C" fn readlinkat(
+    dirfd: c_int,
+    path: *const c_char,
+    buffer: *mut c_char,
+    size: libc::size_t,
+) -> libc::ssize_t {
+    let dirfd = match dirfd {
+        DARWIN_AT_FDCWD => libc::AT_FDCWD,
+        fd => fd,
+    };
     // Read into this crate's own buffer rather than the caller's: an absolute
     // target is a host path, and the guest spelling of it is not necessarily
     // the same length.
     let mut target = [0u8; libc::PATH_MAX as usize];
-    let read = with_fallback(path, |path| {
+    let read = with_fallback_at(dirfd, path, |path| {
         // SAFETY: the caller's obligation for `path`; `target` is a live local
         // of the host's `PATH_MAX`.
-        let n = unsafe { libc::readlink(path, target.as_mut_ptr().cast::<c_char>(), target.len()) };
+        let n = unsafe {
+            libc::readlinkat(
+                dirfd,
+                path,
+                target.as_mut_ptr().cast::<c_char>(),
+                target.len(),
+            )
+        };
         (n, n >= 0)
     });
     if read < 0 {
@@ -1228,6 +1254,7 @@ exports::exports! {
         "faccessat" => faccessat,
         "realpath" => realpath,
         "readlink" => readlink,
+        "readlinkat" => readlinkat,
         "open" => open,
         "open_dprotected_np" => open_dprotected_np,
         "openat" => openat,
@@ -1484,11 +1511,11 @@ mod tests {
         };
         let (rc, followed) = stat_at(c"link", 0);
         assert_eq!(rc, 0);
-        assert_eq!(followed.mode as u32 & 0o170000, libc::S_IFREG.into());
+        assert_eq!(followed.mode as u32 & 0o170000, libc::S_IFREG as _);
         assert_eq!(followed.size, 3);
         let (rc, link) = stat_at(c"link", DARWIN_AT_SYMLINK_NOFOLLOW);
         assert_eq!(rc, 0);
-        assert_eq!(link.mode as u32 & 0o170000, libc::S_IFLNK.into());
+        assert_eq!(link.mode as u32 & 0o170000, libc::S_IFLNK as _);
         let (rc, folded) = stat_at(c"contents/game.ios", 0);
         assert_eq!(rc, 0, "the case fold stays relative to the descriptor");
         assert_eq!(folded.size, 3);

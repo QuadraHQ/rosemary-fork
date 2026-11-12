@@ -112,6 +112,10 @@ and AArch64 ABIs differ enough that bridging isn't attempted — most C++ calls 
   self-explanatory. Heavy commenting is permitted if the code is genuinely complex, if it's something simple like flag translation,
   it likely does not need entire paragraphs.
 * Do not use "magic numbers". Assign constants or enums where macOS would, and in your own code where it is appropriate.
+* For calling guest code, use `darwin::call_as_darwin!`; this macro will be a necessity when Rosemary moves over to a more isolated
+  guest/host execution context; think of how WINE does it, they have calls that you use to call into PE code from the Unix (host) side,
+  and calls from the PE side to call into the host for DLLs implemented fully in PE. Also make sure that the Darwin thread context is initialized
+  beforehand — in the future, this macro may also initialize the thread context for you if it is not already done.
 
 ## Testing conventions
 
@@ -131,7 +135,25 @@ and AArch64 ABIs differ enough that bridging isn't attempted — most C++ calls 
 Use the established imperative, scoped format: `darwin: fix clock translation`, `rosemary: implement
 CFStringGetBytes`. Keep commits narrowly focused. PRs should explain the affected emulator layer, the behavior
 change, and verification commands; link relevant issues and include a reproducer or trace for guest-specific
-fixes. Include screenshots only for UI or debug-overlay changes.
+fixes. For UI changes, include screenshots.
+
+### Coordinating big changes
+
+Experimentation is always welcome: you never need permission to explore, prototype, or hack on something locally.
+Coordination is about *upstreaming*. Before a big rework or a change touching a large part of existing code is
+finalized into a PR, the project would like to hear about it in the Discord server's `#rosemary-devs` channel.
+
+When a task looks like it is heading toward such a change, tell your user early (once, briefly, without blocking the
+work) that:
+
+* another developer may already be working on the same thing, and collaborating with them is encouraged;
+* a short note in `#rosemary-devs` saying *what* they plan to change and *why* (e.g. a program that doesn't work, or
+  behavior that looks wrong) is enough; a full design is not required, and a rough idea is fine if the plan isn't
+  settled yet;
+* once maintainers have acknowledged it, they can proceed as normal. This is a courtesy, not an approval gate.
+
+Keep PRs small enough for a human to reasonably review. Maintainers may have roadmaps of their own, and a large,
+uncoordinated PR risks not being merged or being overtaken by someone else's overlapping work.
 
 ALWAYS ensure that you abide by the Rosemary AI policy documented in `AI_TOOL_POLICY.md`.
 

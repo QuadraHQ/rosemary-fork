@@ -963,6 +963,24 @@ pub unsafe extern "C" fn key_create(
     }
 }
 
+/// `int pthread_key_init_np(int key, void (*destructor)(void *))`
+///
+/// Gives a static key, which a framework claims by number rather than
+/// creating, its destructor. Swift's runtime keeps its thread state in these.
+///
+/// # Safety
+///
+/// `destructor` is null or a function this process can call.
+pub unsafe extern "C" fn key_init_np(
+    key: i32,
+    destructor: Option<unsafe extern "C" fn(*mut core::ffi::c_void)>,
+) -> i32 {
+    match u32::try_from(key) {
+        Ok(key) => crate::tls::key::Key::from_index(key).init_static(destructor),
+        Err(_) => err::EINVAL,
+    }
+}
+
 /// `int pthread_join(pthread_t, void **)`
 ///
 /// Wrapped for its *result*: the arguments and the handle agree on both
@@ -997,10 +1015,13 @@ const DEFAULT_STACK: usize = 8 * 1024 * 1024;
 const MIN_STACK: usize = 1024 * 1024;
 
 fn stack_size(attributes: &Attributes) -> usize {
-    attributes
-        .stack_size
-        .unwrap_or(DEFAULT_STACK)
-        .max(MIN_STACK)
+    host_stack_size(attributes.stack_size)
+}
+
+/// The host stack a guest thread that asked for `requested` bytes, or for
+/// nothing, is given.
+pub fn host_stack_size(requested: Option<usize>) -> usize {
+    requested.unwrap_or(DEFAULT_STACK).max(MIN_STACK)
 }
 
 /// What [`create`] hands the host thread: the guest's start routine and its argument.
@@ -1117,6 +1138,35 @@ pub unsafe extern "C" fn create(out: u64, attr: u64, start: u64, arg: u64) -> i3
     0
 }
 
+/// Start a detached host thread running `start(arg)` on a stack of `stack_size`
+/// bytes, for a framework that starts threads of its own to run guest code on.
+///
+/// The thread starts as the host left it: `start` publishes it with
+/// [`publish_self`] and enters Darwin itself. Fails with a Darwin errno.
+pub fn spawn_detached(
+    stack_size: usize,
+    start: extern "C" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void,
+    arg: *mut core::ffi::c_void,
+) -> Result<(), i32> {
+    let mut attr = HostAttr::new()?;
+    // SAFETY: an initialised attribute set this function owns.
+    let rc = unsafe {
+        match libc::pthread_attr_setdetachstate(attr.as_mut_ptr(), libc::PTHREAD_CREATE_DETACHED) {
+            0 => libc::pthread_attr_setstacksize(attr.as_mut_ptr(), stack_size),
+            rc => rc,
+        }
+    };
+    if rc != 0 {
+        return Err(err::from_host(rc));
+    }
+    let mut thread = null_thread();
+    // SAFETY: as above; `start` owns `arg` from here.
+    match unsafe { libc::pthread_create(&mut thread, attr.as_mut_ptr(), start, arg) } {
+        0 => Ok(()),
+        rc => Err(err::from_host(rc)),
+    }
+}
+
 /// `int pthread_detach(pthread_t)`
 ///
 /// # Safety
@@ -1221,6 +1271,7 @@ exports::exports! {
         "pthread_rwlockattr_getpshared" => rwlockattr_getpshared,
 
         "pthread_key_create" => key_create,
+        "pthread_key_init_np" => key_init_np,
         "pthread_once" => sync::once_entry,
         "pthread_key_delete" => key_delete,
         "pthread_getspecific" => getspecific,

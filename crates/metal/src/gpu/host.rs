@@ -14,6 +14,12 @@
 //! a binding, whose extent no call states - imports the mapping whole, once.
 //! An import pins its pages, so what stays uncommitted is exactly what no
 //! work on the device has named.
+//!
+//! Every live import is also revalidated by the kernel on every submission
+//! (amdgpu userptr objects), and making one costs about 100us. So a copy out
+//! of pages the device has never been given does not import them at all: the
+//! command buffer copies the bytes into its own upload memory when it is
+//! committed (see `CommandBuffer::copy_source`).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -99,6 +105,13 @@ impl HostPages {
     pub fn contents(&self) -> *mut u8 {
         self.base
     }
+
+    /// Whether the device has ever been given these pages. Imports last as
+    /// long as the pages do, so once true this stays true.
+    pub fn imported(&self) -> bool {
+        self.whole.load(Ordering::Acquire) != 0
+            || !self.imports.lock().expect("host imports").is_empty()
+    }
 }
 
 impl Gpu {
@@ -111,22 +124,10 @@ impl Gpu {
             return None;
         }
         let size = length.checked_next_multiple_of(host.alignment)?;
-        // SAFETY: a fresh private anonymous mapping; nothing else names it.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            return None;
-        }
+        let base =
+            starnix::memory::anonymous(size as usize, libc::PROT_READ | libc::PROT_WRITE).ok()?;
         Some(HostPages {
-            base: base.cast(),
+            base: base.as_ptr(),
             size,
             whole: AtomicU64::new(0),
             imports: Mutex::new(Vec::new()),

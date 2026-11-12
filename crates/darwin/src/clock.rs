@@ -1,7 +1,10 @@
 #![cfg_attr(target_os = "macos", allow(dead_code))]
 
 use std::ffi::c_char;
+use std::ffi::c_int;
 use std::ffi::c_void;
+
+use crate::translation::DarwinTranslation;
 
 /// Darwin's 64-bit `struct timeval` from `<sys/_types/_timeval.h>`.
 ///
@@ -119,6 +122,82 @@ unsafe extern "C" fn lutimes(path: *const c_char, times: *const Timeval) -> i32 
         let rc = unsafe { libc::lutimes(path, times) };
         (rc, rc == 0)
     })
+}
+
+/// Darwin's `UTIME_NOW` and `UTIME_OMIT` from `<sys/stat.h>`; Linux spells
+/// them `(1 << 30) - 1` and `(1 << 30) - 2`.
+const DARWIN_UTIME_NOW: i64 = -1;
+const DARWIN_UTIME_OMIT: i64 = -2;
+
+/// Darwin's `AT_SYMLINK_NOFOLLOW`.
+const DARWIN_AT_SYMLINK_NOFOLLOW: c_int = 0x20;
+
+/// Convert the two guest timespecs into host-owned storage, translating the
+/// `UTIME_NOW` and `UTIME_OMIT` markers. Null keeps meaning "now" for both.
+unsafe fn timespecs(times: *const crate::stat::Timespec) -> Option<[libc::timespec; 2]> {
+    let host = |time: crate::stat::Timespec| {
+        let nsec = match time.nsec {
+            DARWIN_UTIME_NOW => libc::UTIME_NOW,
+            DARWIN_UTIME_OMIT => libc::UTIME_OMIT,
+            nsec => nsec,
+        };
+        libc::timespec {
+            tv_sec: time.sec,
+            tv_nsec: nsec,
+        }
+    };
+    (!times.is_null()).then(|| unsafe {
+        [
+            host(times.read_unaligned()),
+            host(times.add(1).read_unaligned()),
+        ]
+    })
+}
+
+/// `int utimensat(int fd, const char *path, const struct timespec[2], int flag)`
+///
+/// # Safety
+///
+/// `path` is a NUL-terminated string, `times` is null or two readable
+/// timespecs, and `dirfd` a directory descriptor or Darwin's `AT_FDCWD`.
+unsafe extern "C" fn utimensat(
+    dirfd: c_int,
+    path: *const c_char,
+    times: *const crate::stat::Timespec,
+    flag: c_int,
+) -> i32 {
+    if flag & !DARWIN_AT_SYMLINK_NOFOLLOW != 0 {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    }
+    let host_flag = if flag & DARWIN_AT_SYMLINK_NOFOLLOW != 0 {
+        libc::AT_SYMLINK_NOFOLLOW
+    } else {
+        0
+    };
+    let dirfd = match dirfd {
+        crate::stat::DARWIN_AT_FDCWD => libc::AT_FDCWD,
+        fd => fd,
+    };
+    let host = unsafe { timespecs(times) };
+    let times = host.as_ref().map_or(core::ptr::null(), |v| v.as_ptr());
+    crate::stat::with_fallback_at(dirfd, path, |path| {
+        if !crate::stat::may_write_at(dirfd, path) {
+            return (-1, false);
+        }
+        let rc = unsafe { libc::utimensat(dirfd, path, times, host_flag) };
+        (rc, rc == 0)
+    })
+}
+
+/// `int futimens(int fd, const struct timespec[2])`
+///
+/// # Safety
+///
+/// `times` is null or two readable timespecs.
+unsafe extern "C" fn futimens(fd: c_int, times: *const crate::stat::Timespec) -> i32 {
+    let host = unsafe { timespecs(times) };
+    unsafe { libc::futimens(fd, host.as_ref().map_or(core::ptr::null(), |v| v.as_ptr())) }
 }
 
 /// `int utime(const char *, const struct utimbuf *)`. Both `time_t` fields have
@@ -304,8 +383,160 @@ unsafe extern "C" fn clock() -> u64 {
     unsafe { host::clock() as u64 }
 }
 
+/// Use this type to decorate a mutable pointer (ie from a header)
+/// that doesn't actually have safe mutability, but you want to convey
+/// what the source code specifies.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct Immutable<T> {
+    val: T,
+}
+
+impl<T> Immutable<T> {
+    pub const fn new(val: T) -> Self {
+        Self { val }
+    }
+
+    pub const fn get(&self) -> &T {
+        &self.val
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Tm {
+    sec: c_int,
+    min: c_int,
+    hour: c_int,
+    mday: c_int,
+    mon: c_int,
+    year: c_int,
+    wday: c_int,
+    yday: c_int,
+    isdst: c_int,
+    gmtoff: i64,
+    /// `char *` in the SDK, but it names a string the guest must not write.
+    zone: Immutable<*mut c_char>,
+}
+
+impl Tm {
+    const ZERO: Tm = Tm {
+        sec: 0,
+        min: 0,
+        hour: 0,
+        mday: 0,
+        mon: 0,
+        year: 0,
+        wday: 0,
+        yday: 0,
+        isdst: 0,
+        zone: Immutable::new(core::ptr::null_mut()),
+        gmtoff: 0,
+    };
+}
+
+impl DarwinTranslation<libc::tm> for Tm {
+    fn to_host(&self) -> libc::tm {
+        libc::tm {
+            tm_sec: self.sec,
+            tm_min: self.min,
+            tm_hour: self.hour,
+            tm_mday: self.mday,
+            tm_mon: self.mon,
+            tm_year: self.year,
+            tm_wday: self.wday,
+            tm_yday: self.yday,
+            tm_isdst: self.isdst,
+            tm_gmtoff: self.gmtoff as _,
+            tm_zone: *self.zone.get() as _,
+        }
+    }
+
+    fn from_host(host: &libc::tm) -> Self {
+        Self {
+            sec: host.tm_sec,
+            min: host.tm_min,
+            hour: host.tm_hour,
+            mday: host.tm_mday,
+            mon: host.tm_mon,
+            year: host.tm_year,
+            wday: host.tm_wday,
+            yday: host.tm_yday,
+            isdst: host.tm_isdst,
+            gmtoff: host.tm_gmtoff as i64,
+            zone: Immutable::new(host.tm_zone as *mut c_char),
+        }
+    }
+}
+
+const _: () = {
+    assert!(size_of::<Tm>() == 56);
+    assert!(std::mem::offset_of!(Tm, gmtoff) == 40);
+    assert!(std::mem::offset_of!(Tm, zone) == 48);
+};
+
+/// The zone Darwin's `gmtime` names, where glibc's names "GMT".
+const UTC: &std::ffi::CStr = c"UTC";
+
+/// The broken-down UTC time of `*clock`, with Darwin's zone name.
+///
+/// # Safety
+///
+/// `clock` is readable.
+unsafe fn utc(clock: *const libc::time_t) -> Option<Tm> {
+    // SAFETY: an all-zero `struct tm` is a valid one to overwrite.
+    let mut host: libc::tm = unsafe { core::mem::zeroed() };
+    // SAFETY: the caller's obligation for `clock`; `host` is a live local.
+    if unsafe { libc::gmtime_r(clock, &mut host) }.is_null() {
+        return None;
+    }
+    Some(Tm {
+        zone: Immutable::new(UTC.as_ptr().cast_mut()),
+        ..Tm::from_host(&host)
+    })
+}
+
+/// `struct tm *gmtime_r(const time_t *, struct tm *)`
+///
+/// # Safety
+///
+/// `clock` is readable and `result` writable for one Darwin `struct tm`.
+unsafe extern "C" fn gmtime_r(clock: *const libc::time_t, result: *mut Tm) -> *mut Tm {
+    // SAFETY: the caller's obligation for `clock`.
+    let Some(tm) = (unsafe { utc(clock) }) else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: the caller's obligation; guest memory need not be Rust-aligned.
+    unsafe { result.write_unaligned(tm) };
+    result
+}
+
+// Darwin keeps `gmtime`'s result per thread rather than in one static shared
+// with the host's own `gmtime` and `localtime`.
+thread_local! {
+    static GMTIME: core::cell::UnsafeCell<Tm> = const { core::cell::UnsafeCell::new(Tm::ZERO) };
+}
+
+/// `struct tm *gmtime(const time_t *)`
+///
+/// # Safety
+///
+/// `clock` is readable.
+unsafe extern "C" fn gmtime(clock: *const libc::time_t) -> *mut Tm {
+    // SAFETY: the caller's obligation for `clock`.
+    let Some(tm) = (unsafe { utc(clock) }) else {
+        return core::ptr::null_mut();
+    };
+    let slot = GMTIME.with(core::cell::UnsafeCell::get);
+    // SAFETY: this thread's own buffer, which lives as long as the thread.
+    unsafe { slot.write(tm) };
+    slot
+}
+
 exports::exports! {
     functions {
+        "gmtime" => gmtime,
+        "gmtime_r" => gmtime_r,
         "clock_gettime" => gettime,
         "clock_getres" => getres,
         "clock_settime" => settime,
@@ -317,6 +548,8 @@ exports::exports! {
         "utimes" => utimes,
         "futimes" => futimes,
         "lutimes" => lutimes,
+        "utimensat" => utimensat,
+        "futimens" => futimens,
         "settimeofday" => settimeofday,
     }
 }
@@ -324,6 +557,119 @@ exports::exports! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(test: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rosemary-clock-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temporary directory");
+        dir
+    }
+
+    fn c_path(path: &std::path::Path) -> std::ffi::CString {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::CString::new(path.as_os_str().as_bytes()).expect("no NUL")
+    }
+
+    fn mtime(path: &std::path::Path) -> i64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).expect("a file").mtime()
+    }
+
+    #[test]
+    fn utimensat_sets_a_symlinks_own_time_with_darwins_nofollow() {
+        let dir = scratch("utimensat-nofollow");
+        // The target does not exist, as `tar` restores a link before its file.
+        std::os::unix::fs::symlink("missing", dir.join("link")).expect("a symlink");
+        let link = c_path(&dir.join("link"));
+        let at = crate::stat::Timespec {
+            sec: 1_000_000,
+            nsec: 0,
+        };
+        let times = [at, at];
+        // SAFETY: a NUL-terminated path and two timespecs.
+        let rc = unsafe {
+            utimensat(
+                crate::stat::DARWIN_AT_FDCWD,
+                link.as_ptr(),
+                times.as_ptr(),
+                DARWIN_AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        assert_eq!(rc, 0, "utimensat: {}", std::io::Error::last_os_error());
+        assert_eq!(mtime(&dir.join("link")), 1_000_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn futimens_leaves_an_omitted_time_alone() {
+        let dir = scratch("futimens-omit");
+        let path = dir.join("file");
+        std::fs::write(&path, b"x").expect("a file");
+        let file = std::fs::File::open(&path).expect("an open file");
+        let set = crate::stat::Timespec {
+            sec: 2_000_000,
+            nsec: 0,
+        };
+        let omit = crate::stat::Timespec {
+            sec: 0,
+            nsec: DARWIN_UTIME_OMIT,
+        };
+        use std::os::fd::AsRawFd;
+        // SAFETY: a live descriptor and two timespecs.
+        unsafe {
+            assert_eq!(futimens(file.as_raw_fd(), [set, set].as_ptr()), 0);
+            assert_eq!(futimens(file.as_raw_fd(), [set, omit].as_ptr()), 0);
+        }
+        assert_eq!(mtime(&path), 2_000_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gmtime_names_its_zone_utc() {
+        let epoch: libc::time_t = 0;
+        let mut tm = Tm::ZERO;
+        let mut text = [0 as c_char; 16];
+        // SAFETY: a readable time, a writable `struct tm` and a sized buffer.
+        unsafe {
+            assert!(!gmtime_r(&epoch, &mut tm).is_null());
+            let host = tm.to_host();
+            let n = libc::strftime(text.as_mut_ptr(), text.len(), c"%Z %Y".as_ptr(), &host);
+            assert_eq!(
+                &std::ffi::CStr::from_ptr(text.as_ptr()).to_bytes()[..n],
+                b"UTC 1970"
+            );
+            let zone = *(*gmtime(&epoch)).zone.get();
+            assert_eq!(std::ffi::CStr::from_ptr(zone), UTC);
+        }
+    }
+
+    #[test]
+    fn gmtime_leaves_the_host_static_alone() {
+        let epoch: libc::time_t = 0;
+        // SAFETY: a readable time; the host's static is only read here.
+        unsafe {
+            let host = libc::gmtime(&epoch);
+            let zone = (*host).tm_zone;
+            let guest = gmtime(&epoch);
+            assert_ne!(guest as usize, host as usize);
+            assert_eq!((*host).tm_zone, zone);
+        }
+    }
+
+    #[test]
+    fn gmtime_keeps_a_buffer_per_thread() {
+        let epoch: libc::time_t = 0;
+        // SAFETY: a readable time.
+        let here = unsafe { gmtime(&epoch) } as usize;
+        // SAFETY: a readable time.
+        let there = std::thread::spawn(move || unsafe { (*gmtime(&86_400)).yday })
+            .join()
+            .expect("the thread");
+        assert_eq!(there, 1);
+        // SAFETY: this thread's buffer is still live.
+        assert_eq!(unsafe { (*(here as *const Tm)).yday }, 0);
+    }
 
     #[test]
     fn time_answers_and_stores_the_same_second() {

@@ -9,6 +9,7 @@ license.workspace = true
 exports.workspace = true
 objc.workspace = true
 corefoundation.workspace = true
+prefix.workspace = true
 darwin.workspace = true
 machish.workspace = true
 foundation.workspace = true
@@ -16,3 +17,6 @@ getrandom.workspace = true
 rustls-pki-types.workspace = true
 webpki.workspace = true
 webpki-roots.workspace = true
+
+[lints]
+workspace = true

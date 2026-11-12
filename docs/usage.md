@@ -18,6 +18,23 @@ bundle resource lookup apply. Invalid bundles report an error.
 
 Binaries and apps installed in the prefix take priority over host filesystem paths. Think of this as a sort of "overlay" - if `/Applications/MyApp.app` is present in your prefix, Rosemary prioritizes the prefix first. If not, it will search the host filesystem for that directory.
 
+## Compiling ahead of time
+
+The `emulated` backend keeps an on-disk cache of x86-64 code compiled ahead of time
+(see `docs/aot.md`). A run that finds an image of its program uncached starts a
+build of it in the background, at the lowest priority, and does not wait for it.
+To build or rebuild the cache yourself, which also takes in the code earlier runs
+had to compile on the fly:
+
+```sh
+rosemary aot /some/app.app
+rosemary aot --deadline 300 --threads 4 /some/app.app/Contents/MacOS/App
+```
+
+`--deadline` stops starting work after that many seconds and writes what finished,
+most important code first; `--only-missing` leaves images that already have a cache
+file alone.
+
 ## Entering a shell
 
 Rosemary ships a full MiniDarwin base system, including basic utilities like `bash` and `zsh`.
@@ -73,9 +90,13 @@ rosemary server --stop         # ask this prefix's server to exit
 | `ROSEMARY_STEAM_TRACE` | unset | Report every bridged Steamworks call on stderr: the dispatch id, the host interface, and the vtable slot it landed on. |
 | `ROSEMARY_TRACE_BINDINGS` | unset | Report on stderr each Cocoa binding value handed to a bound object through `-setValue:forKey:` (the plain `NSObject` binding, as opposed to a control's own setter): the bound class and binding, the observed class and key path, and the value's address. |
 | `ROSEMARY_SWAP_INTERVAL` | `none` | Force a specific swap interval on OpenGL applications. Allows enabling immediate (0), VSync (1), and -1 (Adaptive VSync), along with other V-blank values, allowing unlocked framerate on apps that use VSync. |
+| `ROSEMARY_GL_HOST_FEATURES` | `0` | (built-in OpenGL) Offer the GL driver's own version, extensions and entry points instead of a Mac's (GL 4.1 core, 2.1 legacy, Apple's export list). Some programs have newer GL paths that a Mac never takes; the price is that the program runs code no Mac tested, which is what the default exists to prevent. |
 | `ROSEMARY_PREFIX` | the default prefix (`off` on macOS) | The prefix a guest runs in: a directory holding a Darwin filesystem, whose `root/` subdirectory is the guest's `/`. Unset, `rosemary run` uses `$XDG_DATA_HOME/rosemary/prefixes/default` (or `$HOME/.local/share/rosemary/prefixes/default`), creating it on first use. Set it to another path to keep a guest's files separate, or to `off` to leave guest paths alone entirely. |
 | `ROSEMARY_PREFIX_HOME` | `prefix` | Where the guest's home directory is. `prefix` keeps it inside the prefix, so a prefix is one directory to copy, archive or delete. `host` mounts the guest's `/Users/<name>` onto the real `$HOME` instead, for a user who would rather keep one set of documents than two. |
 | `ROSEMARY_PREFIX_SETUP` | `ask` | What to do when a prefix needs its Darwin base and it is not cached. `ask` asks - a dialog under `rosemary run` when there is a display, then the terminal - and declines when there is nobody to ask. `download` fetches it without asking. `fail` never downloads. The base is verified against hashes compiled into Rosemary whichever route it takes. |
+| `ROSEMARY_AOT_CACHE` | `$XDG_CACHE_HOME/rosemary/aot` | Where code compiled ahead of time is cached, and where each run logs the image code it had to JIT (`profile/`). Falls back to `$HOME/.cache/rosemary/aot`; `0`, `off` or empty disables both. See `docs/aot.md`. |
+| `ROSEMARY_AOT_BACKGROUND` | on | `0` or `off` stops a run from starting `rosemary aot` in the background when an image of its program has no cache file. |
+| `ROSEMARY_AOT_CACHE_KEEP` | unset | Keep the AOT caches of other Rosemary builds instead of removing them when this build stores one, for bisecting between two builds. |
 | `ROSEMARY_ROOTFS_CACHE` | `$XDG_CACHE_HOME/rosemary/rootfs` | Where verified Darwin bases are cached, shared by every prefix. Falls back to `$HOME/.cache/rosemary/rootfs`. |
 | `ROSEMARY_ENVIRON` | unset | (builtin libc) Variables the guest starts with, one `NAME=VALUE` per line. A line that is a bare `NAME` copies the host's value, if it has one. Nothing else of the host's environment reaches the guest: it gets only `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH`, `TMPDIR` and `PWD` with its own values, plus the host's `TERM` and `COLORTERM`, and `LANG` and `LC_*` unless the guest is an application bundle (an app launched from the Finder has no locale variables; a bare `LANG` line still copies it). This keeps a Darwin program from following host settings such as `DISPLAY` or `QT_PLUGIN_PATH`. Example: `ROSEMARY_ENVIRON=$'FOO=bar\nDISPLAY'`. |
 | `ROSEMARY_FORWARD_ENV_VARS` | unset | (builtin libc) Comma-separated names of variables a guest may set for a Rosemary process it launches (another Mach-O it `exec`s or spawns); a name ending in `*` matches by prefix. Unset, nothing the guest sets reaches that process's own environment. Read from Rosemary's environment, never the guest's, unless the list names `ROSEMARY_FORWARD_ENV_VARS` itself. Example: `ROSEMARY_STATS,ROSEMARY_TRACE_PREFIX`. |
@@ -95,7 +116,9 @@ rosemary server --stop         # ask this prefix's server to exit
 | `ROSEMARY_GLIBC` | `auto` | (packaged builds) Which glibc the launcher runs Rosemary on: `host`, `bundled`, or `auto`, which uses the host's when it defines every symbol version the bundle's libraries need and the bundled one otherwise. |
 | `ROSEMARY_EXE` | (set by the launcher) | The path that starts another copy of Rosemary. Under the bundled glibc the kernel reports the bundled dynamic loader as this process's executable, so the runtime re-launches itself (`rosemary server`, a guest spawning a Mach-O) through this instead. |
 | `ROSEMARY_METAL_PRESENTATION_MODE` | unset | Set the presentation mode used by Vulkan in Rosemary's Metal translation. Valid values are `immediate`, `fifo`, `fifo_relaxed`, and `mailbox`. |
+| `ROSEMARY_SHADER_CACHE` | `$XDG_CACHE_HOME/rosemary/metal-shaders` | Where Metal shaders translated to SPIR-V are cached, together with each GPU's Vulkan pipeline cache (`pipelines-<vendor>-<device>-<uuid>.bin`), so a second run neither retranslates shaders nor recompiles pipelines. Falls back to `$HOME/.cache/rosemary/metal-shaders`. Each build of the translator keeps its own subdirectory and removes the others; `ROSEMARY_SHADER_CACHE_KEEP` keeps them. Set to `off`, `0` or the empty string to disable both caches. |
 | `ROSEMARY_SCREEN_REFRESH_RATE` | unset | Hertz that guests are told the display refreshes at, in place of the host's mode: `NSScreen`/`UIScreen` `maximumFramesPerSecond` and the refresh-interval properties. |
+| `ROSEMARY_EXPOSE_LIBSYSTEM_EXTENSIONS` | unset | Whether to enable Rosemary specific extensions useful for implementing out of tree features to Rosemary. Disabled by default for full environment accuracy. Set to `1` to enable it - See `crates/darwin/src/rosemary/mod.rs` for more details. |
 
 ## Prefixes
 
@@ -211,8 +234,14 @@ context. Contexts move between threads through a bounded handoff; an EGL backend
 can fall back to a sibling sharing textures and buffers, but not vertex arrays,
 framebuffers, or queries. Other backends report contention if handoff fails.
 
-Direct CGL pixel-format/context creation and lifetime APIs, and explicit context
-sharing, remain unsupported. The built-in GLU surface provides `gluOrtho2D`
-through SDL-resolved `glOrtho`; other GLU functions remain unsupported. No host
-GLU library is required. Driver capabilities still determine available profiles
-and extensions.
+The framework answers exactly the names Apple's `OpenGL.framework`, `libGL.dylib`
+and `libGLU.dylib` export (lists in `crates/opengl/src/exports/`), so a `dlsym`
+of a newer function such as `glDispatchCompute` is null, as on a Mac. Each GL
+name binds to the driver function of the same name or to Rosemary's own. A
+context reports a Mac's profile: core contexts are GL 4.1 with GLSL 4.10, legacy
+contexts GL 2.1 with GLSL 1.20, and both list only the extensions a Mac lists
+for that profile and the driver also has. `ROSEMARY_GL_HOST_FEATURES=1` offers
+the driver's own version, extensions and functions instead.
+
+The built-in GLU surface provides `gluOrtho2D` through the driver's `glOrtho`;
+other GLU functions are unbound. No host GLU library is required.

@@ -4,13 +4,17 @@ mod format;
 mod guard;
 mod host;
 mod memory;
+mod pipeline_cache;
 mod placement;
 mod pools;
 mod submit;
 mod trace;
 
-use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex, OnceLock, atomic::AtomicBool};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{
+    Arc, Condvar, Mutex, MutexGuard, Once, OnceLock,
+    atomic::{AtomicBool, AtomicUsize},
+};
 
 use ash::{Device, Entry, Instance, vk};
 use static_init::dynamic;
@@ -19,13 +23,14 @@ use crate::heap::{Allocation, Heap};
 
 pub(crate) use format::sample_count;
 pub use format::{
-    aspect_of, block_extent, is_srgb, pixel_format, pixel_format_components, shader_aspect,
-    srgb_twin, texel_size,
+    aspect_of, block_extent, is_integer, is_srgb, pixel_format, pixel_format_components,
+    shader_aspect, srgb_twin, texel_size,
 };
 pub(crate) use guard::{Guard, GuardedVec};
 pub use host::HostPages;
+pub use memory::Fill;
 pub use placement::Placement;
-pub use submit::Batch;
+pub use submit::{Batch, Commit};
 use trace::dump_spirv;
 pub use trace::{milestone, trace, trace_once};
 
@@ -48,6 +53,8 @@ struct DeviceCapabilities {
     sampler_mirror_clamp_to_edge: bool,
     host_query_reset: bool,
     timeline_semaphores: bool,
+    dynamic_rendering: bool,
+    dynamic_raster: bool,
 }
 
 /// What `VK_KHR_depth_stencil_resolve` - core in Vulkan 1.2 - can do on this
@@ -87,10 +94,12 @@ pub struct Gpu {
     /// Some ICDs do not tolerate concurrent VkSwapchain/semaphore creation
     /// and vkQueuePresentKHR for different windows on a shared device.
     pub(crate) wsi: Mutex<()>,
-    /// Commits hold this across the guest submit and every presentation
-    /// submit attached to it. Queue calls themselves keep using `queue` for
-    /// Vulkan's external-synchronization rule.
-    submission_boundary: Mutex<()>,
+    /// Command buffers committed and not yet submitted. Whoever takes the
+    /// queue submits them first, so the queue keeps the order of commits.
+    commits: submit::Commits,
+    /// Submissions on the queue which wait for an event. Work behind one may
+    /// run only once the CPU signals it, after writes it makes past commit.
+    pub(crate) event_waits_in_flight: AtomicUsize,
     /// In-flight work and its completion worker are device-local. Independent
     /// Vulkan devices must never head-of-line block one another.
     pub(crate) submissions: crate::submission::Tracker,
@@ -107,7 +116,8 @@ pub struct Gpu {
     /// One layout per distinct set of Metal binding indices, so pipelines
     /// sharing a resource shape share a layout.
     layouts: Mutex<DescriptorLayouts>,
-    render_passes: Mutex<HashMap<RenderPassKey, vk::RenderPass>>,
+    render_passes: Mutex<crate::hash::FastMap<RenderPassKey, vk::RenderPass>>,
+    pipeline_cache: pipeline_cache::PipelineCache,
     /// Fence-owned immediate command contexts. Recording or waiting on an
     /// unrelated window must not hold a global command-pool mutex.
     immediate: Mutex<ImmediatePool>,
@@ -120,6 +130,13 @@ pub struct Gpu {
     /// The blocks `MTLStorageModePrivate` buffers are cut out of: device
     /// memory, never mapped.
     private_buffers: OnceLock<Heap>,
+    /// The blocks ordinary textures are cut out of, one heap per memory
+    /// type: textures disagree on which types admit them, and none is
+    /// linear, so none needs `bufferImageGranularity` from a neighbour.
+    private_images: [OnceLock<Heap>; vk::MAX_MEMORY_TYPES],
+    /// Zeros a reused heap range is copied from where a texture cannot be
+    /// cleared: see `Gpu::zero_image`. Never written after it is made.
+    zeros: OnceLock<vk::Buffer>,
     /// Two-timestamp query pools, one per command buffer in flight, kept for
     /// reuse by command-buffer timing and the optional statistics.
     timestamp_pools: Mutex<Vec<vk::QueryPool>>,
@@ -134,6 +151,17 @@ pub struct Gpu {
     pub(crate) occlusion_precise: bool,
     /// Whether a pipeline can force coverage-written alpha to one.
     pub(crate) alpha_to_one: bool,
+    /// Whether culling, winding, depth and stencil state and the topology
+    /// within its class are set per draw, as Vulkan 1.3 can, rather than
+    /// compiled into one pipeline per combination.
+    pub(crate) dynamic_render_state: bool,
+    /// Whether a pass begins with `vkCmdBeginRendering` rather than a render
+    /// pass and framebuffer, so a pipeline is independent of the pass's load,
+    /// store and resolve actions.
+    pub(crate) dynamic_rendering: bool,
+    /// `VK_EXT_extended_dynamic_state3`'s polygon mode and depth clamp, where
+    /// the device has both: fill and depth clip mode are then set per draw too.
+    pub(crate) dynamic_raster: Option<ash::ext::extended_dynamic_state3::Device>,
     host_query_reset: bool,
     /// Whether the device has timeline semaphores, which `MTLEvent`s are.
     pub(crate) timeline_semaphores: bool,
@@ -147,7 +175,11 @@ pub struct Gpu {
     secondaries: Mutex<Vec<SecondaryContext>>,
     context_budget: ContextBudget,
     descriptor_pools: Mutex<Vec<vk::DescriptorPool>>,
-    upload_chunks: Mutex<Vec<GpuBuffer>>,
+    /// Each with when it was handed back, as for `staging_buffers`.
+    upload_chunks: Mutex<Vec<(GpuBuffer, std::time::Instant)>>,
+    /// Larger host-visible buffers for texture uploads and readbacks.
+    /// Each with when it was handed back, so idle ones can be freed.
+    staging_buffers: Mutex<Vec<(GpuBuffer, std::time::Instant)>>,
     /// `VK_KHR_push_descriptor`, where advertised, and the descriptor limit
     /// which decides whether one set in a pipeline can use it.
     push_descriptor_api: Option<ash::khr::push_descriptor::Device>,
@@ -257,6 +289,19 @@ impl ContextBudget {
             limit,
         }
     }
+
+    /// How many retired command contexts are kept for reuse. A larger budget
+    /// lets more command buffers retire together, and each one past this is
+    /// rebuilt from scratch on the next acquire.
+    fn recycled_contexts(&self) -> usize {
+        self.limit.div_ceil(2)
+    }
+
+    /// How many upload chunks are kept for reuse, in proportion to the
+    /// command buffers whose `-setBytes:` copies they hold.
+    fn recycled_upload_chunks(&self) -> usize {
+        self.limit.div_ceil(4)
+    }
 }
 
 /// How many retired objects of each kind are kept for reuse. Enough for the
@@ -267,6 +312,29 @@ const RECYCLED: usize = 32;
 /// The size of one chunk `-setBytes:` copies are cut from. Metal limits one
 /// copy to four kilobytes, so a chunk holds a frame's worth of them.
 pub const UPLOAD_CHUNK: u64 = 256 << 10;
+
+/// The most staging memory a device keeps for reuse between transfers too
+/// large for an upload chunk.
+const STAGING_POOL_BYTES: u64 = 64 << 20;
+
+/// The size of the zero-filled buffer textures that cannot be cleared are
+/// copied from, a band at a time.
+const ZERO_SOURCE: u64 = 1 << 20;
+
+/// How long a pooled staging buffer may sit unused before it is freed, so a
+/// burst of large transfers does not keep its memory for good.
+const STAGING_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Makes the next device behave as one without `VK_KHR_push_descriptor`, so
+/// its descriptor paths are tested on a device which has the extension.
+#[cfg(test)]
+pub(crate) static TEST_WITHOUT_PUSH_DESCRIPTORS: AtomicBool = AtomicBool::new(false);
+
+/// Makes the next device begin passes through render passes and keep fill
+/// and depth clip mode in its pipelines, so the paths for devices without
+/// dynamic rendering are tested on one which has it.
+#[cfg(test)]
+pub(crate) static TEST_WITHOUT_DYNAMIC_RENDERING: AtomicBool = AtomicBool::new(false);
 
 /// How many occlusion queries one pool holds; a command buffer which needs
 /// more takes another pool.
@@ -308,6 +376,12 @@ fn create_device(
     };
     let mut v13 = vk::PhysicalDeviceVulkan13Features {
         shader_demote_to_helper_invocation: target.demote_to_helper_invocation.into(),
+        dynamic_rendering: capabilities.dynamic_rendering.into(),
+        ..Default::default()
+    };
+    let mut dynamic_raster = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT {
+        extended_dynamic_state3_polygon_mode: vk::TRUE,
+        extended_dynamic_state3_depth_clamp_enable: vk::TRUE,
         ..Default::default()
     };
     let mut storage16 = vk::PhysicalDevice16BitStorageFeatures {
@@ -403,6 +477,9 @@ fn create_device(
     if capabilities.swapchain_maintenance1 {
         create_info = create_info.push_next(&mut swapchain_maintenance1);
     }
+    if capabilities.dynamic_raster {
+        create_info = create_info.push_next(&mut dynamic_raster);
+    }
     // SAFETY: all feature structures and borrowed create-info data live
     // across the call, and every enabled bit came from the adapter query.
     unsafe { instance.create_device(physical, &create_info, None) }
@@ -452,6 +529,29 @@ pub struct RenderPassKey {
     /// texture.
     pub depth_resolve: Option<DepthResolve>,
     pub samples: vk::SampleCountFlags,
+}
+
+impl RenderPassKey {
+    /// The depth and stencil attachment formats of a pass of this shape: its
+    /// one depth/stencil attachment, under each aspect the format has, as a
+    /// render pass attachment of that format holds both.
+    pub fn depth_stencil_formats(&self) -> (vk::Format, vk::Format) {
+        let Some((format, _, _)) = self.depth else {
+            return (vk::Format::UNDEFINED, vk::Format::UNDEFINED);
+        };
+        let aspect = aspect_of(format);
+        let under = |wanted| {
+            if aspect.contains(wanted) {
+                format
+            } else {
+                vk::Format::UNDEFINED
+            }
+        };
+        (
+            under(vk::ImageAspectFlags::DEPTH),
+            under(vk::ImageAspectFlags::STENCIL),
+        )
+    }
 }
 
 /// A depth/stencil resolve destination and the mode each aspect resolves
@@ -680,6 +780,35 @@ impl Gpu {
         if host_import {
             enabled.push(ash::ext::external_memory_host::NAME.as_ptr());
         }
+        // Both are core in Vulkan 1.3, as are the other dynamic draw states;
+        // dynamic rendering alone has a feature bit.
+        let dynamic_rendering = target.vulkan_version >= (1, 3) && {
+            let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
+            let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut v13);
+            // SAFETY: the device reports Vulkan 1.3 and both structures live
+            // across the query.
+            unsafe { instance.get_physical_device_features2(physical, &mut features) };
+            v13.dynamic_rendering == vk::TRUE
+        };
+        #[cfg(test)]
+        let dynamic_rendering = dynamic_rendering
+            && !TEST_WITHOUT_DYNAMIC_RENDERING.load(std::sync::atomic::Ordering::Acquire);
+        let dynamic_raster =
+            target.vulkan_version >= (1, 3) && has(ash::ext::extended_dynamic_state3::NAME) && {
+                let mut state3 = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT::default();
+                let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut state3);
+                // SAFETY: the extension is advertised and both structures
+                // live across the query.
+                unsafe { instance.get_physical_device_features2(physical, &mut features) };
+                state3.extended_dynamic_state3_polygon_mode == vk::TRUE
+                    && state3.extended_dynamic_state3_depth_clamp_enable == vk::TRUE
+            };
+        #[cfg(test)]
+        let dynamic_raster = dynamic_raster
+            && !TEST_WITHOUT_DYNAMIC_RENDERING.load(std::sync::atomic::Ordering::Acquire);
+        if dynamic_raster {
+            enabled.push(ash::ext::extended_dynamic_state3::NAME.as_ptr());
+        }
         let calibration = clock::Calibration::extension(entry, instance, physical, has);
         if let Some(name) = calibration {
             enabled.push(name.as_ptr());
@@ -716,6 +845,8 @@ impl Gpu {
                 sampler_mirror_clamp_to_edge: mirror_clamp_feature,
                 host_query_reset,
                 timeline_semaphores,
+                dynamic_rendering,
+                dynamic_raster,
             },
         )?;
         // SAFETY: the family was requested above with one queue.
@@ -723,6 +854,7 @@ impl Gpu {
         // SAFETY: the physical device belongs to this live instance.
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
         let properties = unsafe { instance.get_physical_device_properties(physical) };
+        let pipeline_cache = pipeline_cache::PipelineCache::open(&device, &properties);
 
         let depth_stencil_resolve = resolve_support.map(|support| DepthStencilResolve {
             renderpass2: depth_stencil_resolve_extension
@@ -736,9 +868,14 @@ impl Gpu {
             render_node,
         });
         let calibration = calibration.map(|name| clock::Calibration::new(instance, &device, name));
+        let dynamic_raster = dynamic_raster
+            .then(|| ash::ext::extended_dynamic_state3::Device::new(instance, &device));
         let host_import = host_import
             .then(|| host::HostImport::new(instance, physical, &device))
             .flatten();
+        #[cfg(test)]
+        let pushes =
+            pushes && !TEST_WITHOUT_PUSH_DESCRIPTORS.load(std::sync::atomic::Ordering::Acquire);
         let push_descriptor_api =
             pushes.then(|| ash::khr::push_descriptor::Device::new(instance, &device));
         let max_push_descriptors = if pushes {
@@ -767,7 +904,8 @@ impl Gpu {
             queue_family,
             queue: Mutex::new(queue),
             wsi: Mutex::new(()),
-            submission_boundary: Mutex::new(()),
+            commits: submit::Commits::default(),
+            event_waits_in_flight: AtomicUsize::new(0),
             submissions: crate::submission::Tracker::new(),
             deferred: deferred::Deferred::default(),
             presenter: crate::present::Presenter::new(),
@@ -775,19 +913,25 @@ impl Gpu {
             memory,
             limits: properties.limits,
             layouts: Mutex::new(HashMap::new()),
-            render_passes: Mutex::new(HashMap::new()),
+            render_passes: Mutex::new(Default::default()),
+            pipeline_cache,
             immediate: Mutex::new(ImmediatePool::default()),
             immediate_ready: Condvar::new(),
             #[cfg(test)]
             fail_immediate_wait_after_submit: AtomicBool::new(false),
             buffers: OnceLock::new(),
             private_buffers: OnceLock::new(),
+            private_images: std::array::from_fn(|_| OnceLock::new()),
+            zeros: OnceLock::new(),
             timestamp_pools: Mutex::new(Vec::new()),
             timestamp_period: properties.limits.timestamp_period,
             timestamp_valid_bits: families[queue_family as usize].timestamp_valid_bits,
             occlusion_pools: Mutex::new(Vec::new()),
             occlusion_precise: features.occlusion_query_precise == vk::TRUE,
             alpha_to_one: features.alpha_to_one == vk::TRUE,
+            dynamic_render_state: target.vulkan_version >= (1, 3),
+            dynamic_rendering,
+            dynamic_raster,
             host_query_reset,
             timeline_semaphores,
             contexts: Mutex::new(Vec::new()),
@@ -795,6 +939,7 @@ impl Gpu {
             context_budget: ContextBudget::new(),
             descriptor_pools: Mutex::new(Vec::new()),
             upload_chunks: Mutex::new(Vec::new()),
+            staging_buffers: Mutex::new(Vec::new()),
             push_descriptor_api,
             max_push_descriptors,
             null_descriptors,
@@ -811,6 +956,36 @@ impl Gpu {
             host_imported: std::sync::atomic::AtomicU64::new(0),
             calibration,
         })
+    }
+}
+
+impl Gpu {
+    /// The cache every pipeline of this device is made through.
+    pub(crate) fn pipeline_cache(&self) -> vk::PipelineCache {
+        self.pipeline_cache.handle
+    }
+
+    /// Where the pipeline cache is saved, where the shader cache is enabled.
+    #[cfg(test)]
+    pub(crate) fn pipeline_cache_path(&self) -> Option<&std::path::Path> {
+        self.pipeline_cache.path()
+    }
+
+    /// How many bytes the driver reports for a cache made from `initial`, or
+    /// from the saved file where it is `None`.
+    #[cfg(test)]
+    pub(crate) fn reopened_pipeline_cache_bytes(&self, initial: Option<&[u8]>) -> Option<usize> {
+        self.pipeline_cache.reopened_bytes(&self.device, initial)
+    }
+
+    /// Note that a guest pipeline was made through [`Self::pipeline_cache`].
+    pub(crate) fn pipeline_created(&'static self) {
+        self.pipeline_cache.created(&self.device);
+    }
+
+    /// Write the pipeline cache out, if anything was added to it.
+    pub(crate) fn save_pipeline_cache(&self) {
+        self.pipeline_cache.save(&self.device);
     }
 }
 
@@ -838,6 +1013,9 @@ unsafe impl Send for GpuBuffer {}
 pub struct GpuImage {
     pub image: vk::Image,
     pub memory: Option<vk::DeviceMemory>,
+    /// The private-image heap range it is bound into, and that heap's memory
+    /// type, instead of `memory`.
+    pub heap: Option<(u32, Allocation)>,
     /// The placement heap memory it is bound into, instead of `memory`.
     pub placement: Option<Arc<Placement>>,
     pub view: vk::ImageView,
@@ -983,6 +1161,7 @@ impl GpuImage {
         Self {
             image: vk::Image::null(),
             memory: None,
+            heap: None,
             placement: None,
             view: vk::ImageView::null(),
             format: vk::Format::UNDEFINED,

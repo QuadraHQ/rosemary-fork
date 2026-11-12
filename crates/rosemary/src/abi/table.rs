@@ -13,9 +13,13 @@ pub struct FunctionAbi {
     pub variadic: bool,
     /// Parameter indices containing guest function pointers that need thunks.
     pub callbacks: &'static [u8],
-    /// May run guest code outside callbacks, as `dlopen` does with initializers.
-    /// Such calls cannot be inlined before guest state is synchronized.
+    /// May run guest code other than through its callback arguments, as `dlopen`
+    /// does with initializers and `inflate` with a stream's allocators. Such calls
+    /// cannot be inlined before guest state is synchronized.
     pub reenters_guest: bool,
+    /// Reads its guest caller's return address, which only an exit
+    /// synchronizes into the context.
+    pub reads_caller: bool,
 }
 
 impl FunctionAbi {
@@ -127,7 +131,7 @@ fn by_tag(_tag: u64) -> Option<&'static FunctionAbi> {
 /// `(ret, args...)`, in `DynamicSymbol` order.
 macro_rules! sig {
     ($name:literal, $ret:expr $(, $arg:expr)* $(,)?) => {
-        FunctionAbi { name: $name, types: &[$ret $(, $arg)*], variadic: false, callbacks: &[], reenters_guest: false }
+        FunctionAbi { name: $name, types: &[$ret $(, $arg)*], variadic: false, callbacks: &[], reenters_guest: false, reads_caller: false }
     };
 }
 
@@ -141,6 +145,7 @@ macro_rules! vsig {
             variadic: true,
             callbacks: &[],
             reenters_guest: false,
+            reads_caller: false,
         }
     };
 }
@@ -155,6 +160,7 @@ macro_rules! cbsig {
             variadic: false,
             callbacks: &[$($cb),*],
             reenters_guest: false,
+            reads_caller: false,
         }
     };
 }
@@ -169,6 +175,22 @@ macro_rules! rsig {
             variadic: false,
             callbacks: &[],
             reenters_guest: true,
+            reads_caller: false,
+        }
+    };
+}
+
+/// As [`sig`], for a function that asks who called it; see
+/// [`FunctionAbi::reads_caller`].
+macro_rules! csig {
+    ($name:literal, $ret:expr $(, $arg:expr)* $(,)?) => {
+        FunctionAbi {
+            name: $name,
+            types: &[$ret $(, $arg)*],
+            variadic: false,
+            callbacks: &[],
+            reenters_guest: false,
+            reads_caller: true,
         }
     };
 }
@@ -195,6 +217,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("rosemary_steamclient_dispatch", I32, U32, P),
     sig!("getsegbyname", P, P),
     sig!("getsectbyname", P, P, P),
+    sig!("getsectiondata", P, P, P, P, P),
     sig!("get_etext", U64),
     sig!("get_end", U64),
     // OpenAL 1.1. Its scalar typedefs are fixed-width even on Darwin.
@@ -444,7 +467,6 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFBooleanGetValue", BOOL, P),
     sig!("CFDateCreate", P, P, F64),
     sig!("CFDateGetAbsoluteTime", F64, P),
-    sig!("CFAllocatorCreate", P, P, P),
     sig!("CFAllocatorGetDefault", P),
     sig!("CFAllocatorGetTypeID", U64),
     // `CFDataRef CFDataCreate(CFAllocatorRef, const UInt8 *, CFIndex)` - the
@@ -660,6 +682,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFTimeZoneCopyDefault", P),
     sig!("CFTimeZoneCopySystem", P),
     sig!("CFTimeZoneCreateWithName", P, P, P, U8),
+    sig!("CFTimeZoneCreateWithTimeIntervalFromGMT", P, P, F64),
     sig!("CFTimeZoneGetName", P, P),
     sig!("CFStringGetCString", BOOL, P, P, I64, U32),
     sig!("CFStringGetCStringPtr", P, P, U32),
@@ -1558,6 +1581,10 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("SecCodeCheckValidity", I32, P, U32, P),
     sig!("SecStaticCodeCheckValidity", I32, P, U32, P),
     sig!("SecStaticCodeCheckValidityWithErrors", I32, P, U64, P, P),
+    sig!("SecTaskCreateFromSelf", P, P),
+    sig!("SecTaskCopyValueForEntitlement", P, P, P, P),
+    sig!("SecTaskCopySigningIdentifier", P, P, P),
+    sig!("SecTaskGetCodeSignStatus", U32, P),
     //
     // SDL3 asks the current layout for its Unicode key-layout data so it can
     // translate a virtual key code into characters.
@@ -1634,6 +1661,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("___mb_cur_max", I32),
     // Private libSystem collation lookups that Apple's bash declares itself.
     sig!("__collate_lookup", V, P, P, P, P),
+    // `<sys/dirent.h>`'s private block read, which Zig's directory iterator calls.
+    sig!("__getdirentries64", I64, I32, P, U64, P),
     sig!("__collate_lookup_l", V, P, P, P, P, P),
     sig!("___tolower_l", I32, I32, P),
     sig!("___toupper_l", I32, I32, P),
@@ -1692,16 +1721,40 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // What `@available` / `__builtin_available` compiles to: `bool
     // _availability_version_check(uint32_t count, dyld_build_version_t *)`.
     sig!("_availability_version_check", BOOL, U32, P),
+    // `dyld_build_version_t` is two words, packed into one register.
+    sig!("dyld_program_sdk_at_least", BOOL, U64),
+    // Its compiler-rt wrappers, which newer clangs emit for `@available`.
+    sig!("__isPlatformVersionAtLeast", I32, U32, U32, U32, U32),
+    sig!(
+        "__isPlatformOrVariantPlatformVersionAtLeast",
+        I32,
+        U32,
+        U32,
+        U32,
+        U32,
+        U32,
+        U32,
+        U32,
+        U32
+    ),
     // Served by [`crate::dyld::entry`] under both backends.
     sig!("_dyld_image_count", U32),
     sig!("_dyld_get_image_header", P, U32),
     sig!("_NSGetMachExecuteHeader", P),
     sig!("_dyld_get_image_vmaddr_slide", U64, U32),
     sig!("_dyld_image_containing_address", P, P),
+    sig!("dyld_image_path_containing_address", P, P),
+    sig!("dyld_shared_cache_some_image_overridden", BOOL),
+    sig!("_dyld_get_shared_cache_range", P, P),
+    sig!("_dyld_is_preoptimized_objc_image_loaded", BOOL, U16),
+    sig!("_dyld_get_swift_prespecialized_data", P),
+    sig!("_dyld_find_pointer_hash_table_entry", P, P, P, U64, P),
     cbsig!([0], "_dyld_register_func_for_add_image", V, P),
     cbsig!([0], "_dyld_register_func_for_remove_image", V, P),
     sig!("_dyld_get_image_name", P, U32),
     sig!("_dyld_find_unwind_sections", BOOL, P, P),
+    // libobjc's, but answered from the image list. See [`crate::dyld::entry`].
+    cbsig!([0], "objc_addLoadImageFunc", V, P),
     // Initializers run inside `NSAddImage`, as inside `dlopen`.
     rsig!("NSAddImage", P, P, U32),
     sig!("NSAddressOfSymbol", P, P),
@@ -1722,6 +1775,11 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `void *tlv_allocate(tlv_descriptor *)`: the slow path of this runtime's
     // guest-code `tlv_get_addr`. See `crate::tls`.
     sig!("rosemary_tlv_allocate", P, P),
+    // The builtin objc runtime's default `objc_setHook_*` hooks, which a guest
+    // calls as the hook it replaced. See `objc::default_hooks`.
+    sig!("rosemary_objc_default_getClass_hook", U8, P, P),
+    sig!("rosemary_objc_default_getImageName_hook", U8, P, P),
+    sig!("rosemary_objc_default_lazyClassNamer_hook", P, P),
     sig!("abort", V),
     sig!("abs", I32, I32),
     sig!("accept", I32, I32, P, P),
@@ -1883,7 +1941,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("curl_global_cleanup", V),
     sig!("curl_global_init", I32, I64),
     sig!("deflate", I32, P, I32),
-    sig!("deflateEnd", I32, P),
+    // Calls the stream's `zfree`, which the zlib shim made a thunk into guest code.
+    rsig!("deflateEnd", I32, P),
     sig!("deflateInit2_", I32, P, I32, I32, I32, I32, I32, P, I32),
     sig!("deflateInit_", I32, P, I32, P, I32),
     sig!("deflateReset", I32, P),
@@ -1935,7 +1994,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     rsig!("dlclose", I32, P),
     sig!("dlerror", P),
     rsig!("dlopen", P, P, I32),
-    sig!("dlsym", P, P, P),
+    csig!("dlsym", P, P, P),
     vsig!("dprintf", I32, I32, P),
     sig!("dup", I32, I32),
     sig!("dup2", I32, I32, I32),
@@ -2070,6 +2129,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("fts_set", I32, P, P, I32),
     cbsig!([1, 2, 3, 4], "funopen", P, P, P, P, P, P),
     sig!("funlockfile", V, P),
+    sig!("futimens", I32, I32, P),
     sig!("futimes", I32, I32, P),
     sig!("fwrite", U64, P, U64, U64, P),
     sig!("gai_strerror", P, I32),
@@ -2157,6 +2217,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `int getattrlistbulk(int, struct attrlist *, void *, size_t, uint64_t)`
     sig!("getattrlistbulk", I32, I32, P, P, U64, U64),
     sig!("csops", I32, I32, U32, P, U64),
+    sig!("__mac_syscall", I32, P, I32, P),
     //
     // `GLenum`, `GLuint` and `GLbitfield` are `unsigned int`, `GLint` and `GLsizei`
     // are `int`, `GLfloat` is `float`, `GLclampd` is `double`, `GLboolean` is
@@ -2784,8 +2845,10 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("inet_aton", I32, P, P),
     sig!("inet_ntop", P, I32, P, P, U32),
     sig!("inet_pton", I32, I32, P, P),
-    sig!("inflate", I32, P, I32),
-    sig!("inflateEnd", I32, P),
+    // `inflate` allocates its window through the stream's `zalloc`, and
+    // `inflateEnd` frees through `zfree`: thunks into guest code.
+    rsig!("inflate", I32, P, I32),
+    rsig!("inflateEnd", I32, P),
     sig!("inflateInit2_", I32, P, I32, P, I32),
     sig!("inflateInit_", I32, P, P, I32),
     sig!("inflateReset", I32, P),
@@ -2853,6 +2916,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("lstat", I32, P, P),
     sig!("lutimes", I32, P, P),
     sig!("mach_absolute_time", U64),
+    sig!("mach_wait_until", I32, U64),
     sig!("mach_host_self", U32),
     // The three Mach IPC calls `libsteam_api.dylib` makes to talk to the Steam
     // client. They need no translation at all.
@@ -3011,6 +3075,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("nanosleep", I32, P, P),
     sig!("nearbyintf", F32, F32),
     sig!("newlocale", P, I32, P, P),
+    sig!("uselocale", P, P),
     sig!("nextafter", F64, F64, F64),
     sig!("nl_langinfo", P, I32),
     sig!("nl_langinfo_l", P, I32, P),
@@ -3150,6 +3215,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("pthread_join", I32, U64, P),
     // The destructor is guest code, called by libpthread on thread teardown.
     cbsig!([1], "pthread_key_create", I32, P, P),
+    cbsig!([1], "pthread_key_init_np", I32, I32, P),
     sig!("pthread_key_delete", I32, U64),
     // Signals a *host* thread, which is what a guest thread is here, so the
     // disposition it reaches is the one `shims::signal` installed.
@@ -3238,6 +3304,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("readdir_r", I32, P, P, P),
     sig!("readlink", I64, P, P, U64),
     sig!("readlinkat", I64, I32, P, P, U64),
+    sig!("readlinkat", I64, I32, P, P, U64),
     sig!("readv", I64, I32, P, I32),
     sig!("reboot", I32, I32),
     sig!("realloc", P, P, U64),
@@ -3255,6 +3322,15 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("recvmsg", I64, I32, P, I32),
     sig!("remove", I32, P),
     sig!("rename", I32, P, P),
+    sig!("renameat", I32, I32, P, I32, P),
+    // Rosemary's own extension API, exported only when
+    // `ROSEMARY_EXPOSE_LIBSYSTEM_EXTENSIONS` is set. The trampoline's tail is
+    // `argcount` word-sized integers.
+    sig!("rosemary_get_host_rtld_default", P),
+    vsig!("rosemary_host_call_trampoline", U64, P, U64),
+    sig!("rosemary_host_dlclose", I32, P),
+    sig!("rosemary_host_dlopen", P, P, I32),
+    sig!("rosemary_host_dlsym", P, P, P),
     sig!("rewind", V, P),
     // `strrchr` under the name BSD gave it first. `libsteam_api.dylib` uses it
     // to take the directory off its own path while looking for the client.
@@ -3306,6 +3382,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("setgid", I32, U32),
     sig!("setregid", I32, U32, U32),
     sig!("setreuid", I32, U32, U32),
+    sig!("setruid", I32, U32),
+    sig!("setrgid", I32, U32),
     sig!("setgrent", V),
     sig!("setgroups", I32, I32, P),
     sig!("sethostid", V, I64),
@@ -3336,6 +3414,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("audit_submit", I32, I16, U32, U8, I32, P),
     // System Integrity Protection, which `darwin::sip` says is off.
     sig!("csr_check", I32, U32),
+    sig!("csr_get_active_config", I32, P),
     sig!("rootless_restricted_environment", I32),
     sig!("rootless_check_trusted_fd", I32, I32),
     // OpenPAM, `darwin::pam`. The conversation function arrives inside a
@@ -3398,6 +3477,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("strcpy", P, P, P),
     sig!("strcspn", U64, P, P),
     sig!("strdup", P, P),
+    sig!("crypt", P, P, P),
     sig!("strerror", P, I32),
     sig!("strerror_r", I32, I32, P, U64),
     sig!("strftime", U64, P, U64, P, P),
@@ -3456,6 +3536,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("strxfrm_l", U64, P, P, U64, P),
     sig!("swab", V, P, P, I64),
     sig!("symlink", I32, P, P),
+    sig!("symlinkat", I32, P, I32, P),
     sig!("sync", V),
     sig!("sysconf", I64, I32),
     sig!("sysctl", I32, P, U32, P, P, P, U64),
@@ -3542,6 +3623,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("user_from_uid", P, U32, I32),
     sig!("usleep", I32, U32),
     sig!("utime", I32, P, P),
+    sig!("utimensat", I32, I32, P, P, I32),
     sig!("utimes", I32, P, P),
     sig!("uuid_unparse_upper", V, P, P),
     //
@@ -4139,6 +4221,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("lchown", I32, P, U32, U32),
     sig!("fchmodat", I32, I32, P, U16, I32),
     sig!("link", I32, P, P),
+    sig!("linkat", I32, I32, P, I32, P, I32),
     sig!("dirfd", I32, P),
     sig!("fsctl", I32, P, U64, P, U32),
     sig!("ffsctl", I32, I32, U64, P, U32),
@@ -4209,6 +4292,10 @@ pub static REFUSED: &[(&str, &str)] = &[
     // rather than a callback. Refused only against the host's CoreFoundation:
     // with this tree's own, `shims::corefoundation` copies the structure out and
     // substitutes the pointers inside it, and a shim is consulted first.
+    (
+        "CFAllocatorCreate",
+        "its context structure holds guest function pointers the host would call as arm64",
+    ),
     (
         "CFRunLoopSourceCreate",
         "its context structure holds guest function pointers the host would call as arm64",

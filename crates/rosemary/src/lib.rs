@@ -16,6 +16,7 @@
 )]
 
 pub mod abi;
+pub mod aot;
 pub mod atomic128;
 pub mod audit;
 pub mod bridge;
@@ -35,6 +36,7 @@ pub mod interpose;
 pub mod jit;
 pub mod jmpbuf;
 pub mod lldb;
+pub mod prelift;
 pub mod program;
 pub mod region;
 pub mod retstub;
@@ -49,6 +51,7 @@ pub mod stats;
 pub mod steam;
 pub mod thread;
 pub mod thunk;
+pub mod thunk_stub;
 pub mod tls;
 pub mod trace;
 pub mod trampoline;
@@ -71,11 +74,9 @@ pub mod frameworks;
 pub mod objc;
 pub mod objcexc;
 
-/// `OpenGL.framework`, bound to the GL library SDL is using.
-pub mod glsl;
-pub mod macgl;
+/// `OpenGL.framework` in the link chains; the framework is the `opengl` crate.
+pub mod gl;
 pub mod openal;
-pub mod opengl;
 
 /// Subsystems that exist because macOS does.
 ///

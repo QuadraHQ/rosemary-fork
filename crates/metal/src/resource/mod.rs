@@ -25,8 +25,12 @@ pub(crate) use buffer::leaking;
 pub(crate) use buffer::new_buffer;
 pub(crate) use depth_stencil::{DepthStencilState, StencilState, new_depth_stencil_state};
 pub(crate) use heap::new_heap;
+#[cfg(test)]
+pub(crate) use heap::placement_of;
 pub(crate) use heap::{heap_buffer_size_and_align, heap_texture_size_and_align};
 pub(crate) use sampler::{SamplerDescriptor, SamplerState, compare_op, new_sampler};
+#[cfg(test)]
+pub(crate) use texture::Region;
 pub(crate) use texture::{Texture, TextureDescriptor, drawable_texture, new_texture};
 pub(crate) use vertex::{
     Element, IndexedCollection, VERTEX_SLOTS, VertexAttribute, VertexDescriptor, VertexLayout,
@@ -103,6 +107,7 @@ pub(crate) fn install() {
     let texture = object::register::<Texture>(c"RosemaryMTLTexture");
     methods!(descriptor, {
         "init" => descriptor_init, c"@16@0:8";
+        "copyWithZone:" => descriptor_copy, c"@24@0:8^{_NSZone=}16";
         "resourceOptions" => texture::descriptor_resource_options, c"Q16@0:8";
         "setResourceOptions:" => texture::set_descriptor_resource_options, c"v24@0:8Q16";
         "cpuCacheMode" => crate::zero, c"Q16@0:8";

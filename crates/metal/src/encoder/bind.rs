@@ -2,6 +2,12 @@ use super::*;
 
 pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
     stats::count(Counter::Encoders);
+    if kind != Kind::Render {
+        // Blits and dispatches are not tracked by what they touch, so they
+        // wait for every render pass before them.
+        // SAFETY: an encoder is only made by a command buffer of this crate's.
+        unsafe { object::body::<CommandBuffer>(command_buffer) }.flush_hazards();
+    }
     // An encoder is vended autoreleased, as Metal vends one, and reads its
     // command buffer for as long as it lives - so it holds a reference to it
     // rather than trusting the guest to outlive the encoder it made.
@@ -11,6 +17,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             command_buffer: objc::arc::retain(command_buffer),
             kind,
             concurrent: false,
+            barrier_is_last: std::cell::Cell::new(false),
             compute_pipeline: std::ptr::null_mut(),
             render_pipeline: std::ptr::null_mut(),
             depth_state: std::ptr::null_mut(),
@@ -22,7 +29,9 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             winding: 0,
             fill_mode: 0,
             depth_clip: 0,
+            depth_bias: RecordedDepthBias::default(),
             in_render_pass: false,
+            lazy: None,
             sub_encoder: false,
             inheritance: None,
             resolve_mask: 0,
@@ -32,7 +41,10 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             capture_pass: None,
             visibility: None,
             render_variant: None,
+            render_dynamic: None,
             compute_variant: None,
+            attachments: Vec::new(),
+            writes_elsewhere: false,
             bound: Default::default(),
             set_cache: Default::default(),
             wanted: Default::default(),
@@ -85,21 +97,29 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
         }
         return;
     }
+    let mut recorded = true;
     if encoder.in_render_pass {
         let command = encoder.command();
         command
             .occlusion
             .end(&command.gpu.device, command.command_buffer);
-        // SAFETY: a render pass began when the encoder was made.
-        unsafe {
-            command
-                .gpu
-                .device
-                .cmd_end_render_pass(command.command_buffer)
-        };
+        if encoder.lazy.is_some() {
+            recorded = encoder.end_lazy_pass();
+        } else {
+            // A pass began when the encoder was made.
+            end_pass(command.gpu, command.command_buffer);
+        }
         encoder.in_render_pass = false;
         visibility::resolve(encoder);
-        for copy in std::mem::take(&mut encoder.pending_copies) {
+        let copies = std::mem::take(&mut encoder.pending_copies);
+        if !copies.is_empty() {
+            // The copies read what the pass just drew.
+            for &(image, aspect) in &encoder.attachments {
+                command.hazards.note_written(image, aspect);
+            }
+            command.flush_hazards();
+        }
+        for copy in copies {
             let source = vk::ImageSubresourceLayers {
                 aspect_mask: copy.aspect,
                 mip_level: copy.source_level,
@@ -133,6 +153,8 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
                 )
             };
         }
+        // Captures write buffers.
+        encoder.writes_elsewhere |= encoder.capture_pass.is_some();
         let targets = std::mem::take(&mut encoder.capture_targets);
         if let Some(pass) = encoder.capture_pass.take() {
             for target in &targets {
@@ -148,7 +170,17 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
             }
         }
     }
-    encoder.barrier();
+    if encoder.lazy.is_some() && !encoder.writes_elsewhere {
+        if recorded {
+            encoder.leave_pending();
+        }
+        encoder.lazy = None;
+        return;
+    }
+    encoder.lazy = None;
+    if recorded {
+        encoder.barrier();
+    }
 }
 
 /// Whether two entries write one binding - a buffer both stages declare -
@@ -185,6 +217,7 @@ impl Encoder {
 
     /// Record one draw or dispatch, timed under `ROSEMARY_METAL_PROFILE`.
     pub(super) fn record(&self, body: impl FnOnce()) {
+        self.barrier_is_last.set(false);
         let command = self.command();
         let Some(profile) = &command.profile else {
             return body();
@@ -207,6 +240,7 @@ impl Encoder {
 
     /// Record work timed under a fixed name rather than the bound pipeline's.
     pub(super) fn record_named(&self, name: &'static str, body: impl FnOnce()) {
+        self.barrier_is_last.set(false);
         let command = self.command();
         match &command.profile {
             Some(profile) => profile.span(
@@ -221,6 +255,7 @@ impl Encoder {
 
     /// Record work timed under an explicit label, or untimed without one.
     pub(super) fn record_as(&self, label: Option<std::sync::Arc<str>>, body: impl FnOnce()) {
+        self.barrier_is_last.set(false);
         let command = self.command();
         match (&command.profile, label) {
             (Some(profile), Some(label)) => {
@@ -239,11 +274,12 @@ impl Encoder {
     pub(super) fn bind_resources(
         &mut self,
         resources: &[metal_translate::ResourceBinding],
+        inline_samplers: &[vk::Sampler],
         layouts: &Layouts,
         bind_point: vk::PipelineBindPoint,
     ) -> bool {
         let start = stats::enabled().then(std::time::Instant::now);
-        let bound = self.bind_resources_inner(resources, layouts, bind_point);
+        let bound = self.bind_resources_inner(resources, inline_samplers, layouts, bind_point);
         if let Some(start) = start {
             stats::add(Counter::BindMicros, start.elapsed().as_micros() as u64);
         }
@@ -254,10 +290,11 @@ impl Encoder {
     pub(super) fn bind_resources_inner(
         &mut self,
         resources: &[metal_translate::ResourceBinding],
+        inline_samplers: &[vk::Sampler],
         layouts: &Layouts,
         bind_point: vk::PipelineBindPoint,
     ) -> bool {
-        let used = self.collect_writes(resources, layouts);
+        let used = self.collect_writes(resources, inline_samplers, layouts);
         let push_compatible = self.bound[bind_point_slot(bind_point)].layouts == layouts.sets;
         let Some(sets) = self.materialize_sets(&layouts.sets, &used, layouts.push_set) else {
             gpu::trace_once(
@@ -291,6 +328,7 @@ impl Encoder {
     fn collect_writes(
         &mut self,
         resources: &[metal_translate::ResourceBinding],
+        inline_samplers: &[vk::Sampler],
         layouts: &Layouts,
     ) -> [bool; SETS] {
         let gpu = self.command().gpu;
@@ -299,7 +337,8 @@ impl Encoder {
         for wanted in &mut self.wanted {
             wanted.clear();
         }
-        for binding in resources {
+        debug_assert_eq!(resources.len(), inline_samplers.len());
+        for (binding, inline_sampler) in resources.iter().zip(inline_samplers) {
             let set = binding.descriptor_set as usize;
             if set >= SETS {
                 // Rejected by `layouts_for`, so not reachable through a
@@ -384,11 +423,7 @@ impl Encoder {
                     }
                 }
                 ResourceKind::Sampler if binding.inline_sampler.is_some() => {
-                    let made = binding
-                        .inline_sampler
-                        .as_ref()
-                        .map(|sampler| crate::resource::sampler::inline(gpu, sampler))
-                        .unwrap_or_default();
+                    let made = *inline_sampler;
                     use vk::Handle;
                     if made == vk::Sampler::null() {
                         unbound(
@@ -454,7 +489,7 @@ impl Encoder {
     }
 
     /// Allocate or reuse a descriptor set per used set index, writing it only
-    /// when its contents differ from the one this encoder last wrote.
+    /// when no set this command buffer wrote already holds its contents.
     fn materialize_sets(
         &mut self,
         layouts: &[vk::DescriptorSetLayout; SETS],
@@ -477,6 +512,13 @@ impl Encoder {
                 && cache.entries == self.wanted[index]
             {
                 sets[index] = cache.set;
+                continue;
+            }
+            if let Some(set) = command.written_set(layouts[index], &self.wanted[index]) {
+                cache.layout = layouts[index];
+                cache.set = set;
+                std::mem::swap(&mut cache.entries, &mut self.wanted[index]);
+                sets[index] = set;
                 continue;
             }
             let set = command.allocate_set(layouts[index])?;
@@ -550,6 +592,9 @@ impl Encoder {
                 // SAFETY: every referenced info lives across the call, and the
                 // sets are fresh, so no recorded command refers to them yet.
                 unsafe { gpu.device.update_descriptor_sets(&writes, &[]) };
+            }
+            for index in (0..SETS).filter(|index| fresh[*index]) {
+                command.remember_set(layouts[index], &self.set_cache[index].entries, sets[index]);
             }
         }
         Some(sets)
@@ -737,13 +782,18 @@ impl Encoder {
         };
     }
 
-    /// Metal orders the work of one encoder against the next; nothing here
-    /// tracks which resource a later encoder reads, so one full barrier
-    /// between encoders is what keeps the order Metal promises.
+    /// A full barrier: everything recorded before it completes, and its
+    /// writes are visible, before anything after it runs. It closes compute
+    /// and blit encoders, which are not tracked by what they touch, and
+    /// render passes which wrote more than their attachments; see
+    /// [`hazards`](super::hazards) for the passes which did not.
     ///
-    /// It is not what makes a frame slow: removing it entirely takes an app's
-    /// home page from 6.65 ms of device time a frame to 6.45 ms.
+    /// A second barrier with no work recorded since the first orders
+    /// nothing more and is skipped.
     pub(super) fn barrier(&self) {
+        if self.barrier_is_last.replace(true) {
+            return;
+        }
         let command = self.command();
         let memory = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
@@ -760,6 +810,8 @@ impl Encoder {
                 &[],
             )
         };
+        command.hazards.clear();
+        count_barrier();
     }
 
     /// Bind the pipeline variant and the resources one draw needs.
@@ -773,6 +825,7 @@ impl Encoder {
         }
         // SAFETY: only a render pipeline state of this crate's is ever bound.
         let state = unsafe { object::body::<RenderPipeline>(self.render_pipeline) };
+        self.writes_elsewhere |= state.writes_resources;
         if !state.supports_base_instance(base_instance) {
             gpu::trace_once(
                 "a draw with a vertex step rate greater than one and a non-zero base instance is unsupported by this Vulkan device",
@@ -795,14 +848,17 @@ impl Encoder {
             resolve_mask: self.resolve_mask,
             depth_resolve: self.depth_resolve,
         };
-        let pipeline = match self.render_variant {
-            Some((object, cached, pipeline)) if object == self.render_pipeline && cached == key => {
-                pipeline
+        let (pipeline, wanted) = match self.render_variant {
+            Some((object, cached, pipeline, dynamic))
+                if object == self.render_pipeline && cached == key =>
+            {
+                (pipeline, dynamic)
             }
-            _ => match state.variant(&key) {
+            _ => match state.variant(&state.pipeline_key(&key)) {
                 Ok(pipeline) => {
-                    self.render_variant = Some((self.render_pipeline, key, pipeline));
-                    pipeline
+                    let dynamic = state.dynamic_state(&key);
+                    self.render_variant = Some((self.render_pipeline, key, pipeline, dynamic));
+                    (pipeline, dynamic)
                 }
                 Err(reason) => {
                     gpu::trace(format!("render pipeline creation failed: {reason}"));
@@ -814,6 +870,10 @@ impl Encoder {
         let command = self.command();
         let device = &command.gpu.device;
         let vk_command = command.command_buffer;
+        if command.gpu.dynamic_render_state && self.render_dynamic != Some(wanted) {
+            wanted.record(command.gpu, vk_command, self.render_dynamic.as_ref());
+            self.render_dynamic = Some(wanted);
+        }
 
         // Vertex streams are the buffer indices the vertex descriptor claims;
         // every other bound buffer is a descriptor resource. The buffers were
@@ -838,9 +898,13 @@ impl Encoder {
         }
         if !self.bind_resources(
             &state.resources,
+            &state.inline_samplers,
             &state.layouts,
             vk::PipelineBindPoint::GRAPHICS,
         ) {
+            return None;
+        }
+        if !self.ensure_pass() {
             return None;
         }
         gpu::milestone("draw");

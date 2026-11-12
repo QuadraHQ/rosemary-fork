@@ -13,6 +13,7 @@ pub mod boxed;
 pub mod calendar;
 pub mod callbacks;
 pub mod collections;
+pub mod decl;
 mod diskarbitration;
 pub mod eightbit;
 /// Only on Darwin: nowhere else is there another CoreFoundation to meet.
@@ -50,21 +51,14 @@ pub fn bootstrap() {
 
 exports::exports! {
     functions {
-        "CFRetain" => api::CFRetain,
-        "CFRelease" => api::CFRelease,
         "CFAutorelease" => api::CFAutorelease,
         "CFMakeCollectable" => api::CFMakeCollectable,
         "CFGetRetainCount" => api::CFGetRetainCount,
-        "CFGetTypeID" => api::CFGetTypeID,
         "CFCopyDescription" => api::CFCopyDescription,
         "CFShow" => api::CFShow,
-        "CFEqual" => api::CFEqual,
-        "CFHash" => api::CFHash,
         "CFAllocatorGetTypeID" => api::CFAllocatorGetTypeID,
         "CFAllocatorGetDefault" => api::CFAllocatorGetDefault,
         "CFAllocatorCreate" => api::CFAllocatorCreate,
-        "CFStringGetTypeID" => api::CFStringGetTypeID,
-        "CFStringCreateWithCString" => api::CFStringCreateWithCString,
         "CFStringCreateWithFileSystemRepresentation" => api::CFStringCreateWithFileSystemRepresentation,
         "CFStringCreateWithCStringNoCopy" => api::CFStringCreateWithCStringNoCopy,
         "CFStringCreateWithBytes" => api::CFStringCreateWithBytes,
@@ -72,11 +66,9 @@ exports::exports! {
         "CFStringCreateWithCharactersNoCopy" => api::CFStringCreateWithCharactersNoCopy,
         "CFStringCreateCopy" => api::CFStringCreateCopy,
         "CFStringCreateWithSubstring" => api::CFStringCreateWithSubstring,
-        "CFStringGetLength" => api::CFStringGetLength,
         "CFStringGetIntValue" => api::CFStringGetIntValue,
         "CFStringGetDoubleValue" => api::CFStringGetDoubleValue,
         "CFStringGetMaximumSizeForEncoding" => api::CFStringGetMaximumSizeForEncoding,
-        "CFStringGetCString" => api::CFStringGetCString,
         "CFStringGetCStringPtr" => api::CFStringGetCStringPtr,
         "CFStringGetBytes" => api::CFStringGetBytes,
         "CFStringCreateExternalRepresentation" => api::CFStringCreateExternalRepresentation,
@@ -109,13 +101,8 @@ exports::exports! {
         "CFStringGetFileSystemRepresentation" => api::CFStringGetFileSystemRepresentation,
         "CFStringGetMaximumSizeOfFileSystemRepresentation"
             => api::CFStringGetMaximumSizeOfFileSystemRepresentation,
-        "CFArrayGetTypeID" => api::CFArrayGetTypeID,
         "CFArrayCreate" => api::CFArrayCreate,
         "CFArrayApplyFunction" => api::CFArrayApplyFunction,
-        "CFArrayGetCount" => api::CFArrayGetCount,
-        "CFArrayGetValueAtIndex" => api::CFArrayGetValueAtIndex,
-        "CFArrayCreateMutable" => api::CFArrayCreateMutable,
-        "CFArrayAppendValue" => api::CFArrayAppendValue,
         "CFArrayExchangeValuesAtIndices" => api::CFArrayExchangeValuesAtIndices,
         "CFArraySortValues" => api::CFArraySortValues,
         "CFArrayCreateCopy" => api::CFArrayCreateCopy,
@@ -126,34 +113,20 @@ exports::exports! {
         "CFSetApplyFunction" => api::CFSetApplyFunction,
         "CFSetGetCount" => api::CFSetGetCount,
         "CFSetGetValues" => api::CFSetGetValues,
-        "CFDictionaryGetTypeID" => api::CFDictionaryGetTypeID,
         "CFDictionaryCreate" => api::CFDictionaryCreate,
-        "CFDictionaryGetCount" => api::CFDictionaryGetCount,
         "CFDictionaryGetCountOfKey" => api::CFDictionaryGetCountOfKey,
         "CFDictionaryCreateCopy" => api::CFDictionaryCreateCopy,
         "CFDictionaryCreateMutableCopy" => api::CFDictionaryCreateMutableCopy,
         "CFDictionaryApplyFunction" => api::CFDictionaryApplyFunction,
-        "CFDictionaryGetValue" => api::CFDictionaryGetValue,
         "CFDictionaryGetValueIfPresent" => api::CFDictionaryGetValueIfPresent,
         "CFDictionaryContainsKey" => api::CFDictionaryContainsKey,
         "CFDictionaryGetKeysAndValues" => api::CFDictionaryGetKeysAndValues,
-        "CFDictionaryCreateMutable" => api::CFDictionaryCreateMutable,
-        "CFDictionarySetValue" => api::CFDictionarySetValue,
         "CFDictionaryAddValue" => api::CFDictionaryAddValue,
-        "CFNumberGetTypeID" => api::CFNumberGetTypeID,
-        "CFBooleanGetTypeID" => api::CFBooleanGetTypeID,
-        "CFBooleanGetValue" => api::CFBooleanGetValue,
-        "CFNumberCreate" => api::CFNumberCreate,
-        "CFNumberGetValue" => api::CFNumberGetValue,
         "CFNumberGetType" => api::CFNumberGetType,
         "CFNumberIsFloatType" => api::CFNumberIsFloatType,
         "CFNumberGetByteSize" => api::CFNumberGetByteSize,
-        "CFDataGetTypeID" => api::CFDataGetTypeID,
-        "CFDataCreate" => api::CFDataCreate,
         "CFDataCreateWithBytesNoCopy" => api::CFDataCreateWithBytesNoCopy,
         "CFDataCreateCopy" => api::CFDataCreateCopy,
-        "CFDataGetLength" => api::CFDataGetLength,
-        "CFDataGetBytePtr" => api::CFDataGetBytePtr,
         "CFDataGetMutableBytePtr" => api::CFDataGetMutableBytePtr,
         "CFDataSetLength" => api::CFDataSetLength,
         "CFDataIncreaseLength" => api::CFDataIncreaseLength,
@@ -170,6 +143,7 @@ exports::exports! {
         "CFTimeZoneCopyDefault" => timezone::copy_default,
         "CFTimeZoneCopySystem" => timezone::copy_system,
         "CFTimeZoneCreateWithName" => timezone::create_with_name,
+        "CFTimeZoneCreateWithTimeIntervalFromGMT" => timezone::create_with_time_interval_from_gmt,
         "CFTimeZoneGetName" => timezone::get_name,
         "CFURLCreateFromFSRef" => api::CFURLCreateFromFSRef,
         "CFURLGetFSRef" => api::CFURLGetFSRef,
@@ -238,7 +212,6 @@ exports::exports! {
         "CFArrayAppendArray" => api::CFArrayAppendArray,
         "CFRunLoopRemoveSource" => api::CFRunLoopRemoveSource,
         "CFRunLoopContainsSource" => api::CFRunLoopContainsSource,
-        "CFAbsoluteTimeGetCurrent" => api::CFAbsoluteTimeGetCurrent,
         "CFRunLoopTimerCreate" => api::CFRunLoopTimerCreate,
         "CFRunLoopTimerGetContext" => api::CFRunLoopTimerGetContext,
         "CFRunLoopAddTimer" => api::CFRunLoopAddTimer,
@@ -248,6 +221,7 @@ exports::exports! {
         "CFRunLoopGetNextTimerFireDate" => api::CFRunLoopGetNextTimerFireDate,
     }
     groups {
+        decl,
         calendar,
         preferences,
         propertylist,
@@ -955,6 +929,94 @@ mod tests {
         }
     }
 
+    /// Copies `units` into a CFString and runs `CFStringGetBytes` over all
+    /// of it into `room` bytes: the return, `usedBufLen`, and the bytes.
+    fn get_bytes(units: &[u16], encoding: u32, loss_byte: u8, room: usize) -> (i64, i64, Vec<u8>) {
+        bootstrap();
+        let mut buffer = vec![0u8; room];
+        let mut used = 0;
+        // SAFETY: a live buffer and out-parameter sized here.
+        unsafe {
+            let s = api::CFStringCreateWithCharacters(
+                std::ptr::null(),
+                units.as_ptr(),
+                units.len() as base::CFIndex,
+            );
+            let converted = api::CFStringGetBytes(
+                s,
+                0,
+                units.len() as base::CFIndex,
+                encoding,
+                loss_byte,
+                0,
+                buffer.as_mut_ptr(),
+                room as base::CFIndex,
+                &mut used,
+            );
+            api::CFRelease(s);
+            buffer.truncate(used as usize);
+            (converted as i64, used as i64, buffer)
+        }
+    }
+
+    #[test]
+    fn utf32_bytes_count_utf16_units() {
+        let units: Vec<u16> = "a\u{1F600}b".encode_utf16().collect();
+        let (converted, used, bytes) = get_bytes(&units, string::encoding::UTF32_LE, 0, 16);
+        assert_eq!(converted, 4, "a surrogate pair is two characters");
+        assert_eq!(used, 12);
+        let scalars: Vec<u8> = [0x61u32, 0x1F600, 0x62]
+            .iter()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        assert_eq!(bytes, scalars);
+    }
+
+    #[test]
+    fn utf32_bytes_truncate_after_a_whole_pair() {
+        let units: Vec<u16> = "a\u{1F600}b".encode_utf16().collect();
+        let (converted, used, _) = get_bytes(&units, string::encoding::UTF32_BE, 0, 11);
+        assert_eq!((converted, used), (3, 8));
+    }
+
+    #[test]
+    fn utf32_bytes_stop_at_an_unpaired_surrogate_without_a_loss_byte() {
+        let units = [u16::from(b'a'), 0xD83D, u16::from(b'b')];
+        let (converted, used, _) = get_bytes(&units, string::encoding::UTF32_LE, 0, 16);
+        assert_eq!((converted, used), (1, 4));
+    }
+
+    #[test]
+    fn utf32_bytes_write_the_loss_byte_for_an_unpaired_surrogate() {
+        let units = [u16::from(b'a'), 0xDE00, u16::from(b'b')];
+        let (converted, used, bytes) = get_bytes(&units, string::encoding::UTF32_LE, b'?', 16);
+        assert_eq!((converted, used), (3, 12));
+        assert_eq!(&bytes[4..8], &u32::from(b'?').to_le_bytes());
+    }
+
+    #[test]
+    fn a_c_string_with_a_non_bmp_character_fits_in_utf32() {
+        bootstrap();
+        let units: Vec<u16> = "a\u{1F600}b".encode_utf16().collect();
+        let mut buffer = [0 as std::ffi::c_char; 13];
+        // SAFETY: a live buffer sized here.
+        unsafe {
+            let s = api::CFStringCreateWithCharacters(
+                std::ptr::null(),
+                units.as_ptr(),
+                units.len() as base::CFIndex,
+            );
+            let ok = api::CFStringGetCString(
+                s,
+                buffer.as_mut_ptr(),
+                buffer.len() as base::CFIndex,
+                string::encoding::UTF32_LE,
+            );
+            api::CFRelease(s);
+            assert_eq!(ok, 1);
+        }
+    }
+
     /// `-UTF8String` has to answer for a wide string too, where
     /// `CFStringGetCStringPtr` correctly does not.
     #[test]
@@ -1112,11 +1174,11 @@ mod tests {
 #[cfg(test)]
 mod collection_tests {
     use super::*;
-    use base::CFTypeRef;
+    use base::{CFIndex, CFTypeRef};
     use collections::number_type;
     use std::ffi::c_void;
 
-    fn number(kind: i32, value: i64) -> CFTypeRef {
+    fn number(kind: CFIndex, value: i64) -> CFTypeRef {
         // SAFETY: `value` outlives the call and is wider than any `kind` here.
         unsafe {
             api::CFNumberCreate(
@@ -1376,7 +1438,7 @@ mod collection_tests {
             let n = number(created, 0);
             // SAFETY: a number made above.
             unsafe {
-                assert_eq!(api::CFNumberGetType(n), reported as isize, "{created}");
+                assert_eq!(api::CFNumberGetType(n), reported, "{created}");
                 assert_eq!(api::CFNumberGetByteSize(n), size, "{created}");
                 api::CFRelease(n);
             }
@@ -1410,7 +1472,7 @@ mod collection_tests {
                     1
                 );
                 assert_eq!(read, expected);
-                assert_eq!(api::CFNumberGetType(object), number_type::CHAR as isize);
+                assert_eq!(api::CFNumberGetType(object), number_type::CHAR);
                 assert_eq!(api::CFNumberGetByteSize(object), 1);
                 assert_eq!(api::CFNumberIsFloatType(object), 0);
             }
@@ -1445,7 +1507,7 @@ mod collection_tests {
         // SAFETY: each is laid out as its class's instances are.
         unsafe {
             let int = &int as *const Integer as CFTypeRef;
-            assert_eq!(api::CFNumberGetType(int), number_type::SINT32 as isize);
+            assert_eq!(api::CFNumberGetType(int), number_type::SINT32);
             let mut read: i64 = 0;
             assert_eq!(
                 api::CFNumberGetValue(
@@ -1457,9 +1519,9 @@ mod collection_tests {
             );
             assert_eq!(read, -9);
             let unsigned = &unsigned as *const Integer as CFTypeRef;
-            assert_eq!(api::CFNumberGetType(unsigned), number_type::SINT64 as isize);
+            assert_eq!(api::CFNumberGetType(unsigned), number_type::SINT64);
             let real = &real as *const Double as CFTypeRef;
-            assert_eq!(api::CFNumberGetType(real), number_type::FLOAT64 as isize);
+            assert_eq!(api::CFNumberGetType(real), number_type::FLOAT64);
             assert_eq!(api::CFNumberIsFloatType(real), 1);
         }
     }

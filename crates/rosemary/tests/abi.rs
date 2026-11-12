@@ -522,6 +522,7 @@ static EIGHT_INTS: FunctionAbi = FunctionAbi {
     name: "eight_ints",
     callbacks: &[],
     reenters_guest: false,
+    reads_caller: false,
     types: &[
         T::SignedDoubleword,
         T::SignedDoubleword,
@@ -564,6 +565,7 @@ static TWELVE_INTS: FunctionAbi = FunctionAbi {
     name: "twelve_ints_two_doubles",
     callbacks: &[],
     reenters_guest: false,
+    reads_caller: false,
     types: &[
         T::SignedDoubleword,
         T::SignedDoubleword,
@@ -635,6 +637,7 @@ static NARROW_TAIL_4_4_8: FunctionAbi = FunctionAbi {
     name: "eight_longs_int_int_ptr",
     callbacks: &[],
     reenters_guest: false,
+    reads_caller: false,
     types: &[
         T::SignedDoubleword,
         T::SignedDoubleword,
@@ -678,6 +681,7 @@ static NARROW_TAIL_4: FunctionAbi = FunctionAbi {
     name: "eight_longs_int",
     callbacks: &[],
     reenters_guest: false,
+    reads_caller: false,
     types: &[
         T::SignedDoubleword,
         T::SignedDoubleword,
@@ -783,6 +787,7 @@ static THIRTEEN_INTS: FunctionAbi = FunctionAbi {
     name: "thirteen_with_a_bool_on_the_stack",
     callbacks: &[],
     reenters_guest: false,
+    reads_caller: false,
     types: &[
         T::SignedDoubleword,
         T::SignedDoubleword,
@@ -848,6 +853,7 @@ fn an_overflow_too_wide_to_place_is_still_refused_by_name() {
         name: "adjacent_narrows_too_long",
         callbacks: &[],
         reenters_guest: false,
+        reads_caller: false,
         types: &[
             T::SignedDoubleword,
             T::SignedDoubleword,
@@ -958,12 +964,16 @@ fn a_callback_taker_is_refused_without_a_vm_rather_than_passed_through() {
 
 #[test]
 fn a_variadic_with_no_shim_is_refused_rather_than_forwarded() {
-    // `err(3, "...", ...)` cannot be forwarded: its variadic tail is in
-    // registers on the guest's side and on the stack on the host's.
+    // A variadic's tail is in registers on the guest's side and on the stack
+    // on the host's. Any shimless one will do; a shimmed one would really run.
+    let unshimmed = table::SIGNATURES
+        .iter()
+        .find(|abi| abi.variadic && rosemary::shims::resolve(abi.name).is_none())
+        .expect("a variadic with no shim");
     let mut mem = guest_stack();
     let mut ctx = RegisterContext::new();
     let err = rosemary::call_import(
-        "_err",
+        &format!("_{}", unshimmed.name),
         0,
         0x1000,
         &mut ctx,

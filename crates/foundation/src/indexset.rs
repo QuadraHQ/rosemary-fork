@@ -275,6 +275,12 @@ unsafe extern "C" fn is_equal(receiver: Id, sel: Sel, other: Id) -> u8 {
     }
 }
 
+/// `-hash`, equal for sets `-isEqual:` calls equal.
+unsafe extern "C" fn hash(receiver: Id, sel: Sel) -> usize {
+    // SAFETY: an index set.
+    unsafe { count(receiver, sel) }
+}
+
 unsafe extern "C" fn add_index(receiver: Id, _sel: Sel, index: usize) {
     change(receiver, |r| add_range(r, index, index.saturating_add(1)));
 }
@@ -374,6 +380,7 @@ pub(crate) fn install() {
         "countOfIndexesInRange:" => count_in_range, c"Q32@0:8{_NSRange=QQ}16";
         "isEqualToIndexSet:" => is_equal_to_index_set, c"c24@0:8@16";
         "isEqual:" => is_equal, c"c24@0:8@16";
+        "hash" => hash, c"Q16@0:8";
     });
     methods!(mutable, {
         "addIndex:" => add_index, c"v24@0:8Q16";
@@ -385,6 +392,20 @@ pub(crate) fn install() {
         "removeAllIndexes" => remove_all_indexes, c"v16@0:8";
         "shiftIndexesStartingAtIndex:by:" => shift_indexes, c"v32@0:8Q16q24";
     });
+}
+
+/// The indexes `set` holds, in order, as half-open ranges.
+pub(crate) fn ranges_of(set: Id) -> Vec<(usize, usize)> {
+    get(set)
+}
+
+/// A new, autoreleased immutable set of `indexes`, which need not be sorted.
+pub(crate) fn from_indexes(indexes: &[usize]) -> Id {
+    let mut ranges = Ranges::new();
+    for &index in indexes {
+        add_range(&mut ranges, index, index.saturating_add(1));
+    }
+    make(c"NSIndexSet", ranges)
 }
 
 #[cfg(test)]
@@ -416,18 +437,4 @@ mod tests {
         assert_eq!(greater_or_equal(&r, 9), NOT_FOUND);
         assert_eq!(less_or_equal(&r, 0), NOT_FOUND);
     }
-}
-
-/// The indexes `set` holds, in order, as half-open ranges.
-pub(crate) fn ranges_of(set: Id) -> Vec<(usize, usize)> {
-    get(set)
-}
-
-/// A new, autoreleased immutable set of `indexes`, which need not be sorted.
-pub(crate) fn from_indexes(indexes: &[usize]) -> Id {
-    let mut ranges = Ranges::new();
-    for &index in indexes {
-        add_range(&mut ranges, index, index.saturating_add(1));
-    }
-    make(c"NSIndexSet", ranges)
 }

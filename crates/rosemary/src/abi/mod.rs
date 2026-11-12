@@ -455,7 +455,7 @@ pub fn classify(tag: u64, symbol: &str) -> Classification {
         // registers straight through - including the function pointer that has
         // to become a thunk first.
         Lookup::Known(abi) if !abi.callbacks.is_empty() => Classification::Slow,
-        Lookup::Known(abi) if abi.reenters_guest => Classification::Slow,
+        Lookup::Known(abi) if abi.reenters_guest || abi.reads_caller => Classification::Slow,
         Lookup::Known(abi) => {
             if guest_call_abi().can_fast_call(abi.types) && marshal::is_marshallable(abi) {
                 Classification::Fast
@@ -489,6 +489,30 @@ pub fn promotion(name: &str, resolved: u64) -> Option<Promotion> {
 /// [`promotion`] is what actually decides, because only it knows the resolved address.
 pub fn promotable_abi(name: &str) -> Option<&'static FunctionAbi> {
     crate::objc::fast::abi_of(name)
+}
+
+/// The library a promoted import's callee comes from: the one that bound the site,
+/// or this runtime when the promotion substitutes a function of its own.
+pub fn provider<'a>(site: &'a crate::program::ImportSite, promotion: &Promotion) -> &'a str {
+    if promotion.address != site.resolved {
+        return microlift::core::symbol::RUNTIME_PROVIDER;
+    }
+    site.library
+        .as_deref()
+        .unwrap_or(microlift::core::symbol::RUNTIME_PROVIDER)
+}
+
+/// `site`, promoted, as the inline call microlift emits: keyed by provider, name and
+/// ABI, so a cached translation names the callee rather than its address.
+pub fn fast_import(
+    site: &crate::program::ImportSite,
+    promotion: &Promotion,
+) -> microlift::core::FastImport {
+    microlift::core::FastImport::new(
+        provider(site, promotion),
+        dynamic_symbol(promotion.abi, promotion.address),
+        guest_call_abi(),
+    )
 }
 
 /// The `DynamicSymbol` microlift wants for a fast import.

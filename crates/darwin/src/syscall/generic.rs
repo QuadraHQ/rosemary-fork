@@ -35,7 +35,7 @@ fn get_syscall_tracing_mode() -> SyscallTracingMode {
         }
     };
 
-    MODE.clone()
+    *MODE
 }
 
 fn handle_unix_syscall(number: u32, args: [u64; 6]) -> Result<u64, i32> {
@@ -134,6 +134,7 @@ fn handle_mach_syscall(number: u32, args: [u64; 6]) -> Result<u64, i32> {
         numbers::mach::task_name_for_pid | numbers::mach::task_for_pid => {
             Ok(unsafe { mach::tasks::task_for_pid(args[0] as _, args[1] as _, args[2] as _) } as _)
         }
+        numbers::mach::mach_wait_until_trap => Ok(unsafe { mach::wait_until(args[0]) } as _),
         _ => Err(DARWIN_ENOSYS),
     }
 }
@@ -165,12 +166,11 @@ pub(crate) fn generic_syscall_entry(class: u32, number: u32, args: [u64; 6]) -> 
                 eprintln!("rosemary: SYSCALL FAILED: {number:#x} CLASS {class:#x} ERR {errno}")
             }
         }
-    } else if tracing_mode == SyscallTracingMode::Unknown {
-        if let Err(errno) = res
-            && errno == DARWIN_ENOSYS
-        {
-            eprintln!("rosemary: UNRECOGNIZED SYSCALL {number:#x} CLASS {class:#x} ARGS {args:?}");
-        }
+    } else if tracing_mode == SyscallTracingMode::Unknown
+        && let Err(errno) = res
+        && errno == DARWIN_ENOSYS
+    {
+        eprintln!("rosemary: UNRECOGNIZED SYSCALL {number:#x} CLASS {class:#x} ARGS {args:?}");
     }
     res
 }

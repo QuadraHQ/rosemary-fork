@@ -97,8 +97,10 @@ pub(super) unsafe extern "C" fn copy_buffer_to_buffer(
             ),
         );
     }
-    let (from, source_offset) = from.device_range(source_offset, size);
+    // Destination first: a copy within one buffer imports it, so the source
+    // is then read on the device rather than snapshotted.
     let (to, destination_offset) = to.device_range(destination_offset, size);
+    let (from, source_offset) = command.copy_source(source, source_offset, size);
     let region = vk::BufferCopy::default()
         .src_offset(source_offset)
         .dst_offset(destination_offset)
@@ -188,6 +190,9 @@ pub(super) unsafe extern "C" fn copy_buffer_to_texture_options(
             object::body::<Texture>(destination),
         )
     };
+    if to.is_texture_buffer() {
+        return refuse("copyFromBuffer:toTexture:", "a texture buffer has no image");
+    }
     let checked = match to.image.region(gpu::Region {
         level,
         slice,
@@ -214,7 +219,7 @@ pub(super) unsafe extern "C" fn copy_buffer_to_texture_options(
             ),
         );
     }
-    let (buffer, source_offset) = from.device_range(source_offset, total);
+    let (buffer, source_offset) = command.copy_source(source, source_offset, total);
     let region = vk::BufferImageCopy::default()
         .buffer_offset(source_offset)
         .buffer_row_length(row_texels as u32)
@@ -309,6 +314,9 @@ pub(super) unsafe extern "C" fn copy_texture_to_buffer_options(
             object::body::<Buffer>(destination),
         )
     };
+    if from.is_texture_buffer() {
+        return refuse("copyFromTexture:toBuffer:", "a texture buffer has no image");
+    }
     let checked = match from.image.region(gpu::Region {
         level,
         slice,
@@ -397,6 +405,12 @@ pub(super) unsafe extern "C" fn copy_texture_to_texture(
             object::body::<Texture>(destination),
         )
     };
+    if from.is_texture_buffer() || to.is_texture_buffer() {
+        return refuse(
+            "copyFromTexture:toTexture:",
+            "a texture buffer has no image",
+        );
+    }
     let source_region = gpu::Region {
         level: source_level,
         slice: source_slice,
@@ -477,6 +491,9 @@ pub(super) unsafe extern "C" fn generate_mipmaps(receiver: Id, _sel: Sel, textur
     let command = encoder.command();
     // SAFETY: only a texture of this crate's reaches a blit encoder.
     let image = unsafe { object::body::<Texture>(texture) };
+    if image.is_texture_buffer() {
+        return gpu::trace("generateMipmapsForTexture: of a texture buffer, which has no image");
+    }
     let device = &command.gpu.device;
     let vk_command = command.command_buffer;
     let mut width = image.image.width as i32;

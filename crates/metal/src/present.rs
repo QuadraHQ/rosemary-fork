@@ -539,8 +539,13 @@ unsafe extern "C" fn drawable_dealloc(receiver: Id, _sel: Sel) {
             .expect("drawable presentation")
             .handlers,
     );
-    for block in handlers {
-        objc::block::release(block as Id);
+    if !handlers.is_empty() {
+        // The guest's blocks: releasing the last reference runs their
+        // dispose helpers, on whichever thread the drawable dies.
+        let _darwin = darwin::tls::DarwinThread::enter();
+        for block in handlers {
+            objc::block::release(block as Id);
+        }
     }
     // SAFETY: the body was established by `object::make` and is not read again.
     unsafe { std::ptr::drop_in_place(drawable as *mut Drawable) };
@@ -562,7 +567,10 @@ pub(crate) fn enqueue(drawable: Id) {
     presenter.worker.call_once(|| {
         std::thread::Builder::new()
             .name("metal:present".to_string())
-            .spawn(move || present_worker(gpu))
+            .spawn(move || {
+                crate::enter_darwin_thread();
+                present_worker(gpu)
+            })
             .expect("a thread for Metal presentation");
     });
     let mut pending = presenter.pending.lock().expect("presentation queue");
@@ -1313,19 +1321,19 @@ fn present_inner(drawable: Id) {
             gpu::milestone("presented frame");
             crate::stats::frame();
             dump_frame(pixels, width, height, texture.image.format);
-            if let Some(window) = window {
-                if let Some(properties) = sdl3::video::presentation_window(window) {
-                    enqueue_completed_readback(ReadbackFrame {
-                        window: window as usize,
-                        window_id: properties.id,
-                        layer: described.layer as usize,
-                        pixels: pixels.to_vec(),
-                        width,
-                        height,
-                        format: texture.image.format,
-                        placement,
-                    });
-                }
+            if let Some(window) = window
+                && let Some(properties) = sdl3::video::presentation_window(window)
+            {
+                enqueue_completed_readback(ReadbackFrame {
+                    window: window as usize,
+                    window_id: properties.id,
+                    layer: described.layer as usize,
+                    pixels: pixels.to_vec(),
+                    width,
+                    height,
+                    format: texture.image.format,
+                    placement,
+                });
             }
         }
     }
@@ -1418,7 +1426,7 @@ fn mask_readback_surface(
         let (x, w) = (band.x as usize, band.w as usize);
         for y in band.y as usize..(band.y + band.h) as usize {
             let row = &mut pixels[y * pitch + x * 4..y * pitch + (x + w) * 4];
-            for pixel in row.chunks_exact_mut(4) {
+            for pixel in row.as_chunks_mut::<4>().0 {
                 pixel.copy_from_slice(&[0, 0, 0, 255]);
             }
         }
@@ -2512,7 +2520,10 @@ pub(crate) fn present_store(
             let owned = std::sync::Arc::clone(&worker);
             std::thread::Builder::new()
                 .name("rosemary-store-upload".into())
-                .spawn(move || store_upload_worker(owned, retired, key))
+                .spawn(move || {
+                    crate::enter_darwin_thread();
+                    store_upload_worker(owned, retired, key)
+                })
                 .expect("per-window CPU backing-store upload worker");
             all.insert(key, std::sync::Arc::clone(&worker));
             worker
