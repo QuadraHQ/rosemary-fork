@@ -78,12 +78,22 @@ fn native_host() -> bool {
     cfg!(all(target_os = "linux", target_arch = "x86_64"))
 }
 
+/// Linked the way the bridge's users are: no library defines `quadra_host_*`
+/// at link time, so they are bound by flat lookup at load.
+fn probe() -> Option<String> {
+    common::build_x86_64(
+        "hostbridge_probe",
+        BRIDGE,
+        &["-Wl,-undefined,dynamic_lookup"],
+    )
+}
+
 #[test]
 fn host_libraries_are_called_directly_from_native_threads() {
     if !native_host() {
         return;
     }
-    let Some(program) = common::build_x86_64("hostbridge_probe", BRIDGE, &[]) else {
+    let Some(program) = probe() else {
         return;
     };
     let (code, out, err) = common::run_guest_with(&["--native"], &program, &[]);
@@ -103,7 +113,7 @@ fn host_libraries_are_called_directly_from_native_threads() {
 
 #[test]
 fn emulated_backend_refuses_host_libraries() {
-    let Some(program) = common::build_x86_64("hostbridge_probe", BRIDGE, &[]) else {
+    let Some(program) = probe() else {
         return;
     };
     let (_, out, _) = common::run_guest_with(&["--emulated"], &program, &[]);
@@ -118,7 +128,7 @@ fn no_passthrough_refuses_host_libraries() {
     if !native_host() {
         return;
     }
-    let Some(program) = common::build_x86_64("hostbridge_probe", BRIDGE, &[]) else {
+    let Some(program) = probe() else {
         return;
     };
     let out = common::driver_command()
