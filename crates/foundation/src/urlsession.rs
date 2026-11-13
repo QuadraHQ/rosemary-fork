@@ -1,4 +1,5 @@
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use objc::class::Class;
 use objc::object::Id;
@@ -451,17 +452,86 @@ unsafe extern "C" fn expected_content_length(receiver: Id, _sel: Sel) -> i64 {
 /// behaviour `+sharedSession` is documented to have.
 fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| {
-        ureq::Agent::config_builder()
-            .user_agent(concat!("rosemary/", env!("CARGO_PKG_VERSION")))
-            .http_status_as_error(false)
-            .build()
-            .into()
-    })
+    AGENT.get_or_init(|| build_agent(ureq::config::IpFamily::Any))
+}
+
+/// As [`agent`], for a machine where IPv6 does not work: its own pool, holding
+/// only IPv4 connections.
+fn ipv4_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| build_agent(ureq::config::IpFamily::Ipv4Only))
+}
+
+fn build_agent(ip_family: ureq::config::IpFamily) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .user_agent(concat!("rosemary/", env!("CARGO_PKG_VERSION")))
+        .http_status_as_error(false)
+        .ip_family(ip_family)
+        .build()
+        .into()
+}
+
+/// Whether a connection over IPv6 has already failed to find a route.
+///
+/// Kept for the rest of the process, so that later requests go straight to
+/// IPv4 instead of paying for the same failed attempt. Not kept for longer,
+/// because a machine can gain a route while a program is running.
+static IPV6_UNROUTED: AtomicBool = AtomicBool::new(false);
+
+/// Why an attempt failed, as far as the choice of address family cares.
+enum Failure {
+    /// The network had no route to the address that was tried.
+    Unreachable(String),
+    /// Anything else.
+    Other(String),
+}
+
+impl Failure {
+    fn of(error: ureq::Error) -> Failure {
+        match &error {
+            ureq::Error::Io(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::HostUnreachable
+                ) =>
+            {
+                Failure::Unreachable(error.to_string())
+            }
+            _ => Failure::Other(error.to_string()),
+        }
+    }
+
+    fn message(self) -> String {
+        match self {
+            Failure::Unreachable(message) | Failure::Other(message) => message,
+        }
+    }
 }
 
 /// Perform `request`, returning the response and its body or a message.
 fn perform(request: &Request) -> Result<(Response, Vec<u8>), String> {
+    let preferring_ipv4 = IPV6_UNROUTED.load(Ordering::Relaxed);
+    let agent = match preferring_ipv4 {
+        true => ipv4_agent(),
+        false => agent(),
+    };
+    match send(request, agent) {
+        // A host that publishes both families is asked for its IPv6 addresses
+        // first. On a machine that has an IPv6 address but no route to the
+        // wider IPv6 internet those fail with "network unreachable", and that
+        // is not "connection refused", so `ureq` gives up on the whole list
+        // instead of trying the IPv4 addresses the host also published. The
+        // same request, made over IPv4 only, then has somewhere to go.
+        Err(Failure::Unreachable(_)) if !preferring_ipv4 => {
+            IPV6_UNROUTED.store(true, Ordering::Relaxed);
+            send(request, ipv4_agent()).map_err(Failure::message)
+        }
+        result => result.map_err(Failure::message),
+    }
+}
+
+/// One attempt at `request`, over `agent`.
+fn send(request: &Request, agent: &ureq::Agent) -> Result<(Response, Vec<u8>), Failure> {
     let mut builder = ureq::http::Request::builder()
         .method(request.method.as_str())
         .uri(request.url.as_str());
@@ -471,7 +541,7 @@ fn perform(request: &Request) -> Result<(Response, Vec<u8>), String> {
     let timeout = std::time::Duration::from_secs_f64(request.timeout);
     let built = builder
         .body(())
-        .map_err(|e| format!("the request could not be built: {e}"))?;
+        .map_err(|e| Failure::Other(format!("the request could not be built: {e}")))?;
     let (mut parts, ()) = built.into_parts();
     parts.extensions.insert(
         ureq::config::Config::builder()
@@ -484,9 +554,9 @@ fn perform(request: &Request) -> Result<(Response, Vec<u8>), String> {
         true => ureq::SendBody::none(),
         false => ureq::SendBody::from_owned_reader(std::io::Cursor::new(request.body.clone())),
     };
-    let mut response = agent()
+    let mut response = agent
         .run(ureq::http::Request::from_parts(parts, body))
-        .map_err(|e| e.to_string())?;
+        .map_err(Failure::of)?;
 
     let status = response.status().as_u16();
     let headers = response
@@ -506,7 +576,7 @@ fn perform(request: &Request) -> Result<(Response, Vec<u8>), String> {
         .with_config()
         .limit(u64::MAX)
         .read_to_vec()
-        .map_err(|e| format!("the response body could not be read: {e}"))?;
+        .map_err(|e| Failure::Other(format!("the response body could not be read: {e}")))?;
     Ok((
         Response {
             url: request.url.clone(),
@@ -1144,5 +1214,29 @@ mod tests {
             f(error, sel)
         };
         assert_eq!(code, crate::error::NSURL_ERROR_UNKNOWN);
+    }
+
+    /// A machine with no IPv6 route is the reason the attempt is made again
+    /// over IPv4, so that is the one failure that has to be recognised. Every
+    /// other one is a message for the caller, not a reason to try again.
+    #[test]
+    fn only_an_unroutable_address_asks_for_the_other_family() {
+        for kind in [
+            std::io::ErrorKind::NetworkUnreachable,
+            std::io::ErrorKind::HostUnreachable,
+        ] {
+            let failure = Failure::of(ureq::Error::Io(std::io::Error::from(kind)));
+            assert!(
+                matches!(failure, Failure::Unreachable(_)),
+                "{kind:?} is a route problem"
+            );
+        }
+        let failure = Failure::of(ureq::Error::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        )));
+        assert!(
+            matches!(failure, Failure::Other(_)),
+            "a refusal is ureq's own business to retry"
+        );
     }
 }
