@@ -1525,6 +1525,10 @@ pub(crate) fn install() {
         "sizeWithAttributes:" => string_size_with_attributes, c"{CGSize=dd}24@0:8@16";
         "drawInRect:withAttributes:" => string_draw_in_rect, c"v56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48";
         "drawAtPoint:withAttributes:" => string_draw_at_point, c"v40@0:8{CGPoint=dd}16@32";
+        // `NSStringDrawing`, an AppKit category on NSString: the measurement
+        // a guest asks for before laying out a label or an alert.
+        "boundingRectWithSize:options:attributes:" => string_bounding_rect,
+            c"{CGRect={CGPoint=dd}{CGSize=dd}}48@0:8{CGSize=dd}16Q32@40";
     });
     // Foundation keeps the text and attributes; drawing them is AppKit's.
     let attributed = objc::class::lookup(c"NSAttributedString").expect("Foundation registered it");
@@ -1532,8 +1536,6 @@ pub(crate) fn install() {
         "size" => attributed_size, c"{CGSize=dd}16@0:8";
         "drawInRect:" => attributed_draw_in_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "drawAtPoint:" => attributed_draw_at_point, c"v32@0:8{CGPoint=dd}16";
-        "boundingRectWithSize:options:attributes:" => string_bounding_rect,
-            c"{CGRect={CGPoint=dd}{CGSize=dd}}48@0:8{CGSize=dd}16Q32@40";
     });
     let text = objc::class::lookup(c"NSText").expect("declared before its methods");
     methods!(text, {
@@ -2137,5 +2139,39 @@ mod tests {
         unsafe { crate::cgcontext::CGContextScaleCTM(port, 2.0, 2.0) };
         assert_eq!(port_density(port), 2.0);
         clear_current_context(port);
+    }
+
+    /// `NSStringDrawing` is an AppKit category on `NSString`, so a
+    /// `__NSCFString` inherits it. The Roblox installer asks one for a
+    /// bounding rect while it lays out its network error alert.
+    #[test]
+    fn a_string_answers_the_drawing_measurement_appkit_adds_to_it() {
+        crate::bootstrap();
+        let string = foundation::string::from_str("Learn More");
+        let selector = objc::sel::get("boundingRectWithSize:options:attributes:");
+        // SAFETY: a live string.
+        let class = unsafe { objc::object::class_of(string) }.expect("an NSString");
+        let imp = objc::class::method_implementation(class, selector);
+        assert!(
+            !imp.is_null(),
+            "{} does not answer boundingRectWithSize:options:attributes:",
+            class.name_str()
+        );
+        // SAFETY: the method's documented prototype and a live string.
+        let measure: unsafe extern "C" fn(Id, Sel, NSSize, usize, Id) -> NSRect =
+            unsafe { std::mem::transmute(imp) };
+        let rect = unsafe {
+            measure(
+                string,
+                selector,
+                NSSize {
+                    width: 100.0,
+                    height: 100.0,
+                },
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(rect.size.width > 0.0 && rect.size.height > 0.0, "{rect:?}");
     }
 }
