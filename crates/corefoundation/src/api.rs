@@ -1356,6 +1356,185 @@ pub unsafe extern "C" fn CFStringGetCharactersPtr(s: CFTypeRef) -> *const u16 {
     unsafe { string::as_string(s) }.map_or(std::ptr::null(), |s| s.characters_ptr())
 }
 
+/// `CFRange CFStringGetRangeOfComposedCharactersAtIndex(CFStringRef, CFIndex)`.
+///
+/// The range of the grapheme cluster containing `index`, by UAX #29's default
+/// rules: a base with its combining marks, a Hangul syllable's jamo, a pair of
+/// regional indicators, or an emoji sequence joined by zero-width joiners.
+/// Apple calls that a composed character sequence, and a text view asks for it
+/// so that a cursor or an edit does not split one.
+///
+/// `{kCFNotFound, 0}` for an index outside the string, as Apple's answers:
+/// there is no character, let alone a cluster, at an index the string does not
+/// have.
+pub unsafe extern "C" fn CFStringGetRangeOfComposedCharactersAtIndex(
+    s: CFTypeRef,
+    index: CFIndex,
+) -> CFRange {
+    const NOT_FOUND: CFRange = CFRange {
+        location: -1,
+        length: 0,
+    };
+    let Some(s) = (unsafe { string::as_string(s) }) else {
+        return NOT_FOUND;
+    };
+    let Ok(index) = usize::try_from(index) else {
+        return NOT_FOUND;
+    };
+    composed_range(s, index).unwrap_or(NOT_FOUND)
+}
+
+/// Every character of a string with the unit its encoding starts at.
+///
+/// A `CFRange` counts a string's own units - UTF-16 code units for a wide
+/// string and bytes for an 8-bit one, as [`string::CFString::units`] documents -
+/// so rules that count characters have to be able to come back to those units.
+/// An unpaired surrogate is one replacement character occupying the one unit it
+/// occupied as a surrogate, which keeps every later offset right.
+fn characters_with_offsets(s: &string::CFString) -> (Vec<(char, usize)>, usize) {
+    let units = s.units();
+    let mut chars = Vec::with_capacity(units.len());
+    if !s.is_wide() {
+        // An 8-bit string is ASCII by construction - see `string::from_bytes` -
+        // so one byte is one character and one unit.
+        for (at, unit) in units.iter().enumerate() {
+            chars.push((char::from(*unit as u8), at));
+        }
+        return (chars, units.len());
+    }
+    let mut at = 0;
+    for c in String::from_utf16_lossy(&units).chars() {
+        chars.push((c, at));
+        at += c.len_utf16();
+    }
+    (chars, units.len())
+}
+
+/// The character each grapheme cluster starts at, and then the character count.
+///
+/// UAX #29's rules in order, with the two pieces of state the later ones carry:
+/// the run of regional indicators ending at the previous character, and whether
+/// the text so far ends with `Extended_Pictographic Extend* ZWJ`.
+fn grapheme_boundaries(chars: &[(char, usize)]) -> Vec<usize> {
+    use icu_properties::props::{ExtendedPictographic, GraphemeClusterBreak as Gcb};
+
+    /// Where a prefix stands relative to GB11's pictographic sequence.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Pictographic {
+        None,
+        /// `Extended_Pictographic Extend*`.
+        Pict,
+        /// `Extended_Pictographic Extend* ZWJ`.
+        Zwj,
+    }
+
+    let Some((first, _)) = chars.first() else {
+        return vec![0];
+    };
+    let class = icu_properties::CodePointMapData::<Gcb>::new();
+    let pictographic = icu_properties::CodePointSetData::new::<ExtendedPictographic>();
+    let mut starts = vec![0];
+    let mut previous = class.get(*first);
+    let mut pict = match pictographic.contains(*first) {
+        true => Pictographic::Pict,
+        false => Pictographic::None,
+    };
+    let mut regional = match previous == Gcb::RegionalIndicator {
+        true => 1,
+        false => 0,
+    };
+    for (at, (c, _)) in chars.iter().enumerate().skip(1) {
+        let current = class.get(*c);
+        // GB3 and GB4/GB5 are the two places the controls appear, and GB11's
+        // pictographic test is a property of the character, not its break class.
+        let joins = if previous == Gcb::CR && current == Gcb::LF {
+            true
+        } else if is_control(previous) || is_control(current) {
+            false
+        } else if hangul_joins(previous, current) {
+            true
+        } else if current == Gcb::Extend || current == Gcb::ZWJ {
+            // GB9.
+            true
+        } else if current == Gcb::SpacingMark {
+            // GB9a.
+            true
+        } else if previous == Gcb::Prepend {
+            // GB9b.
+            true
+        } else if pict == Pictographic::Zwj && pictographic.contains(*c) {
+            // GB11.
+            true
+        } else {
+            // GB12 and GB13: an odd number of regional indicators before this
+            // one means it is the second half of a pair, and the pair is one
+            // cluster.
+            previous == Gcb::RegionalIndicator
+                && current == Gcb::RegionalIndicator
+                && regional % 2 == 1
+        };
+        if !joins {
+            starts.push(at);
+        }
+        pict = if pictographic.contains(*c) {
+            Pictographic::Pict
+        } else if current == Gcb::ZWJ && pict == Pictographic::Pict {
+            Pictographic::Zwj
+        } else if current == Gcb::Extend && pict == Pictographic::Pict {
+            Pictographic::Pict
+        } else {
+            Pictographic::None
+        };
+        regional = match current == Gcb::RegionalIndicator {
+            true => regional + 1,
+            false => 0,
+        };
+        previous = current;
+    }
+    starts.push(chars.len());
+    starts
+}
+
+fn is_control(class: icu_properties::props::GraphemeClusterBreak) -> bool {
+    use icu_properties::props::GraphemeClusterBreak as Gcb;
+    class == Gcb::Control || class == Gcb::CR || class == Gcb::LF
+}
+
+/// GB6 through GB8: a Hangul syllable's jamo are one cluster.
+fn hangul_joins(
+    previous: icu_properties::props::GraphemeClusterBreak,
+    current: icu_properties::props::GraphemeClusterBreak,
+) -> bool {
+    use icu_properties::props::GraphemeClusterBreak as Gcb;
+    matches!(
+        (previous, current),
+        (Gcb::L, Gcb::L | Gcb::V | Gcb::LV | Gcb::LVT)
+            | (Gcb::LV | Gcb::V, Gcb::V | Gcb::T)
+            | (Gcb::LVT | Gcb::T, Gcb::T)
+    )
+}
+
+/// The cluster containing the character starting at `index`, in string units.
+fn composed_range(s: &string::CFString, index: usize) -> Option<CFRange> {
+    let (chars, length) = characters_with_offsets(s);
+    if index >= length {
+        return None;
+    }
+    // The character whose units contain `index`, so a low surrogate belongs to
+    // the pair it is half of.
+    let at = chars.partition_point(|(_, start)| *start <= index) - 1;
+    let starts = grapheme_boundaries(&chars);
+    let cluster = starts.partition_point(|start| *start <= at) - 1;
+    let first = starts[cluster];
+    let end = starts[cluster + 1];
+    let location = chars[first].1;
+    let after = chars.get(end).map_or(length, |(_, start)| *start);
+    Some(CFRange {
+        location: location as CFIndex,
+        length: (after - location) as CFIndex,
+    })
+}
+
 /// `void CFStringAppendCharacters(CFMutableStringRef, const UniChar *, CFIndex)`.
 pub unsafe extern "C" fn CFStringAppendCharacters(
     target: CFTypeRef,
@@ -1503,6 +1682,34 @@ pub unsafe extern "C" fn CFStringFindWithOptions(
         };
     }
     1
+}
+
+/// `Boolean CFStringFindWithOptionsAndLocale(CFStringRef, CFStringRef, CFRange,
+/// CFStringCompareFlags, CFLocaleRef, CFRange *)`.
+///
+/// The locale is the only difference from [`CFStringFindWithOptions`], and it
+/// is ignored: this runtime's comparison does not have locale-sensitive case
+/// folding to select between, so the search is the same one whichever locale
+/// the caller names.
+pub unsafe extern "C" fn CFStringFindWithOptionsAndLocale(
+    searched: CFTypeRef,
+    needle: CFTypeRef,
+    range_location: CFIndex,
+    range_length: CFIndex,
+    options: u64,
+    _locale: CFTypeRef,
+    result: *mut CFRange,
+) -> Boolean {
+    unsafe {
+        CFStringFindWithOptions(
+            searched,
+            needle,
+            range_location,
+            range_length,
+            options,
+            result,
+        )
+    }
 }
 
 /// `CFRange` is flattened to its two `CFIndex` fields by both 64-bit ABIs.
@@ -4089,6 +4296,126 @@ mod tests {
                 CFStringConvertIANACharSetNameToEncoding(name(c"no-such-charset")),
                 INVALID_ENCODING
             );
+        }
+    }
+
+    #[test]
+    fn a_find_with_a_locale_is_the_search_without_one() {
+        // SAFETY: plain calls on live NUL-terminated literals.
+        unsafe {
+            let string = |text: &core::ffi::CStr| {
+                CFStringCreateWithCString(core::ptr::null(), text.as_ptr(), string::encoding::UTF8)
+            };
+            let haystack = string(c"Hello, world");
+            let needle = string(c"world");
+            let upper = string(c"WORLD");
+            let mut found = CFRange {
+                location: 0,
+                length: 0,
+            };
+            assert_eq!(
+                CFStringFindWithOptionsAndLocale(
+                    haystack,
+                    needle,
+                    0,
+                    12,
+                    0,
+                    core::ptr::null(),
+                    &mut found,
+                ),
+                1
+            );
+            assert_eq!((found.location, found.length), (7, 5));
+            // The case-insensitive flag reaches the same search.
+            assert_eq!(
+                CFStringFindWithOptionsAndLocale(
+                    haystack,
+                    upper,
+                    0,
+                    12,
+                    1,
+                    core::ptr::null(),
+                    &mut found,
+                ),
+                1
+            );
+            assert_eq!((found.location, found.length), (7, 5));
+            // And a range that ends before the match does not contain it.
+            assert_eq!(
+                CFStringFindWithOptionsAndLocale(
+                    haystack,
+                    needle,
+                    0,
+                    5,
+                    0,
+                    core::ptr::null(),
+                    &mut found,
+                ),
+                0
+            );
+            CFRelease(haystack);
+            CFRelease(needle);
+            CFRelease(upper);
+        }
+    }
+
+    #[test]
+    fn composed_characters_span_the_grapheme_cluster_a_unit_is_in() {
+        // SAFETY: plain calls on live strings; the buffer outlives each call,
+        // and the constructor copies it.
+        unsafe fn range(text: &str, index: CFIndex) -> (CFIndex, CFIndex) {
+            let units: Vec<u16> = text.encode_utf16().collect();
+            unsafe {
+                let string = CFStringCreateWithCharacters(
+                    core::ptr::null(),
+                    units.as_ptr(),
+                    units.len() as CFIndex,
+                );
+                let range = CFStringGetRangeOfComposedCharactersAtIndex(string, index);
+                CFRelease(string);
+                (range.location, range.length)
+            }
+        }
+        // SAFETY: the helper's own contract, met by every call.
+        unsafe {
+            // ASCII: one unit per cluster, whatever the index is.
+            assert_eq!(range("abc", 1), (1, 1));
+            // A combining mark belongs to the base it follows (GB9).
+            assert_eq!(range("e\u{301}x", 0), (0, 2));
+            assert_eq!(range("e\u{301}x", 1), (0, 2));
+            assert_eq!(range("e\u{301}x", 2), (2, 1));
+            // A surrogate pair is one character in two units, and both point
+            // back at the same cluster.
+            assert_eq!(range("\u{1F600}", 0), (0, 2));
+            assert_eq!(range("\u{1F600}", 1), (0, 2));
+            // Regional indicators pair up (GB12/13), and a third starts a new
+            // cluster.
+            assert_eq!(range("\u{1F1F7}\u{1F1F4}\u{1F1FA}", 2), (0, 4));
+            assert_eq!(range("\u{1F1F7}\u{1F1F4}\u{1F1FA}", 4), (4, 2));
+            // Conjoining jamo are one syllable (GB6-GB8).
+            assert_eq!(range("\u{1100}\u{1161}\u{11A8}", 1), (0, 3));
+            // An emoji joined by zero-width joiners is one cluster (GB11).
+            assert_eq!(range("\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}", 2), (0, 8));
+            // Outside the string there is no cluster to name.
+            assert_eq!(range("abc", 3), (-1, 0));
+            assert_eq!(range("abc", -1), (-1, 0));
+        }
+    }
+
+    #[test]
+    fn composed_characters_of_an_eight_bit_string_count_its_bytes() {
+        // SAFETY: plain calls on a live NUL-terminated literal, which stays
+        // ASCII and therefore 8-bit storage.
+        unsafe {
+            let string = CFStringCreateWithCString(
+                core::ptr::null(),
+                c"abc".as_ptr(),
+                string::encoding::UTF8,
+            );
+            assert!(!string::as_string(string).unwrap().is_wide());
+            let range = CFStringGetRangeOfComposedCharactersAtIndex(string, 1);
+            assert_eq!((range.location, range.length), (1, 1));
+            CFRelease(string);
         }
     }
 

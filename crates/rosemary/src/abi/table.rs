@@ -648,6 +648,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `Boolean CFStringFindWithOptions(CFStringRef, CFStringRef, CFRange,
     // CFStringCompareFlags, CFRange *)`, with the range flattened.
     sig!("CFStringFindWithOptions", BOOL, P, P, I64, I64, U64, P),
+    // The same call with a `CFLocaleRef` before the result, which this
+    // runtime's search does not consult.
+    sig!("CFStringFindWithOptionsAndLocale", BOOL, P, P, I64, I64, U64, P, P),
     sig!("CFStringConvertEncodingToIANACharSetName", P, U32),
     sig!("CFStringConvertEncodingToNSStringEncoding", U64, U32),
     sig!("CFStringConvertIANACharSetNameToEncoding", U32, P),
@@ -4304,6 +4307,11 @@ pub static REFUSED: &[(&str, &str)] = &[
         "CFRunLoopTimerCreate",
         "its context structure holds guest function pointers the host would call as arm64",
     ),
+    // `CFRange CFStringGetRangeOfComposedCharactersAtIndex(CFStringRef,
+    // CFIndex)` returns sixteen bytes by value, in two integer registers.
+    // Implemented all the same - the native backend calls it directly, with no
+    // marshaller in the way.
+    ("CFStringGetRangeOfComposedCharactersAtIndex", AGGREGATE),
     // `CFUUIDBytes CFUUIDGetUUIDBytes(CFUUIDRef)` returns sixteen bytes by
     // value, in two integer registers, and the marshaller has no type wider
     // than a doubleword to describe that with. Implemented all the same - the
