@@ -16,6 +16,7 @@ pub(super) fn parse(tokens: &[Token]) -> Result<Program> {
         aliases: std::collections::HashMap::new(),
         array_templates: std::collections::HashSet::new(),
         type_params: Vec::new(),
+        value_params: Vec::new(),
     };
     parser.program()?;
     Ok(parser.program)
@@ -37,6 +38,7 @@ struct Parser<'a> {
     array_templates: std::collections::HashSet<String>,
     /// The type parameters of the function template being parsed.
     type_params: Vec<String>,
+    value_params: Vec<(String, Scalar)>,
 }
 
 type Result<T> = std::result::Result<T, TranslateError>;
@@ -214,7 +216,7 @@ impl Parser<'_> {
     /// `member[index]`: an array of `N` `T`s, at least one. Any other
     /// template is refused.
     /// `template <...>` and what it declares: a function template whose
-    /// parameters are all types, or an array wrapper.
+    /// parameters are types or deduced array bounds, or an array wrapper.
     fn template(&mut self) -> Result<()> {
         let line = self.line();
         self.expect("<")?;
@@ -223,8 +225,18 @@ impl Parser<'_> {
         loop {
             if self.eat_word("typename") || self.eat_word("class") {
                 types.push(self.ident()?);
-            } else if self.eat_word("size_t") || self.eat_word("uint") || self.eat_word("int") {
-                values.push(self.ident()?);
+            } else if self.eat_word("size_t") {
+                values.push((
+                    self.ident()?,
+                    Scalar::Int {
+                        signed: false,
+                        bits: 64,
+                    },
+                ));
+            } else if self.eat_word("uint") {
+                values.push((self.ident()?, Scalar::UINT));
+            } else if self.eat_word("int") {
+                values.push((self.ident()?, Scalar::INT));
             } else {
                 return Err(self.error("unsupported template parameter"));
             }
@@ -242,15 +254,11 @@ impl Parser<'_> {
                 )),
             };
         }
-        if !values.is_empty() {
-            return Err(syntax_error(
-                line,
-                "a function template with a non-type parameter is not supported",
-            ));
-        }
         self.type_params = types;
+        self.value_params = values;
         let parsed = self.top_level();
         self.type_params.clear();
+        self.value_params.clear();
         parsed
     }
 
@@ -433,14 +441,17 @@ impl Parser<'_> {
     /// A global variable or a function definition.
     fn top_level(&mut self) -> Result<()> {
         let line = self.line();
-        // Function attributes such as `[[early_fragment_tests]]` precede the
-        // stage; none of them changes what this frontend emits but one.
         let leading = self.attributes()?;
-        if let Some(attribute) = leading.first() {
-            return Err(syntax_error(
-                attribute.line,
-                format!("unsupported function attribute [[{}]]", attribute.name),
-            ));
+        let mut early_fragment_tests = false;
+        for attribute in &leading {
+            if attribute.name == "early_fragment_tests" && attribute.args.is_empty() {
+                early_fragment_tests = true;
+            } else {
+                return Err(syntax_error(
+                    attribute.line,
+                    format!("unsupported function attribute [[{}]]", attribute.name),
+                ));
+            }
         }
         let stage = if self.eat_word("vertex") {
             Some(Stage::Vertex)
@@ -451,6 +462,12 @@ impl Parser<'_> {
         } else {
             None
         };
+        if early_fragment_tests && stage != Some(Stage::Fragment) {
+            return Err(syntax_error(
+                line,
+                "early_fragment_tests requires a fragment function",
+            ));
+        }
         let space = self.skip_qualifiers();
         self.inlining_attributes()?;
         let space = self.skip_qualifiers().or(space);
@@ -514,6 +531,8 @@ impl Parser<'_> {
             }
             self.program.functions.push(FunctionDef {
                 stage,
+                early_fragment_tests,
+                value_params: self.value_params.clone(),
                 ret: ty,
                 name,
                 params,
@@ -535,20 +554,44 @@ impl Parser<'_> {
             ));
         }
         let ty = self.array_suffix(ty)?;
-        self.expect("=")?;
-        let init = self.initializer()?;
+        let mut function_constant = None;
+        for attribute in self.attributes()? {
+            match (attribute.name.as_str(), attribute.args.as_slice()) {
+                ("function_constant", [index]) if function_constant.is_none() => {
+                    function_constant = Some(index.clone());
+                }
+                ("maybe_unused", []) => {}
+                _ => {
+                    return Err(syntax_error(
+                        attribute.line,
+                        format!("unsupported global attribute [[{}]]", attribute.name),
+                    ));
+                }
+            }
+        }
+        let init = if function_constant.is_some() && !self.is_punct("=") {
+            None
+        } else {
+            self.expect("=")?;
+            Some(self.initializer()?)
+        };
         self.expect(";")?;
         // `T name[] = {...}` takes its length from the initializer.
-        let ty = match (ty, &init.kind) {
-            (Ty::Array(element, 0), ExprKind::InitList(items)) => {
-                Ty::Array(element, items.len() as u32)
-            }
+        let ty = match (ty, &init) {
+            (
+                Ty::Array(element, 0),
+                Some(Expr {
+                    kind: ExprKind::InitList(items),
+                    ..
+                }),
+            ) => Ty::Array(element, items.len() as u32),
             (ty, _) => ty,
         };
         self.program.globals.push(Global {
             name,
             ty,
             init,
+            function_constant,
             line,
         });
         Ok(())
@@ -620,25 +663,42 @@ impl Parser<'_> {
     }
 
     fn array_suffix(&mut self, ty: Ty) -> Result<Ty> {
+        enum Bound {
+            Fixed(u32),
+            Parameter(String),
+        }
         let mut dimensions = Vec::new();
         while self.is_punct("[") && !matches!(self.peek_at(1), Some(Kind::Punct("["))) {
             self.at += 1;
             if self.eat("]") {
-                dimensions.push(0);
+                dimensions.push(Bound::Fixed(0));
                 continue;
             }
             let count = match self.peek() {
-                Some(Kind::Int { value, .. }) => *value,
+                Some(Kind::Int { value, .. }) => {
+                    Bound::Fixed(u32::try_from(*value).map_err(|_| self.error("array too long"))?)
+                }
+                Some(Kind::Ident(name))
+                    if self
+                        .value_params
+                        .iter()
+                        .any(|(parameter, _)| parameter == name) =>
+                {
+                    Bound::Parameter(name.clone())
+                }
                 _ => return Err(self.error("an array length must be an integer literal")),
             };
             self.at += 1;
             self.expect("]")?;
-            dimensions.push(u32::try_from(count).map_err(|_| self.error("array too long"))?);
+            dimensions.push(count);
         }
         Ok(dimensions
             .into_iter()
             .rev()
-            .fold(ty, |ty, count| Ty::Array(Box::new(ty), count)))
+            .fold(ty, |ty, count| match count {
+                Bound::Fixed(count) => Ty::Array(Box::new(ty), count),
+                Bound::Parameter(name) => Ty::ArrayParam(Box::new(ty), name),
+            }))
     }
 
     /// Zero or more `[[ ... ]]` groups.
@@ -682,15 +742,22 @@ impl Parser<'_> {
             let ty = self.ty()?;
             // `const` may follow the type, before the indirection.
             self.skip_qualifiers();
+            let grouped = self.eat("(");
             let indirection = if self.eat("&") {
                 Indirection::Reference
             } else if self.eat("*") {
                 Indirection::Pointer
             } else {
+                if grouped {
+                    return Err(self.error("a grouped parameter needs a pointer or reference"));
+                }
                 Indirection::Value
             };
             self.skip_qualifiers();
             let name = self.ident()?;
+            if grouped {
+                self.expect(")")?;
+            }
             let ty = self.array_suffix(ty)?;
             let attributes = self.attributes()?;
             params.push(Param {
@@ -1289,11 +1356,15 @@ impl Parser<'_> {
     }
 
     fn expression(&mut self) -> Result<Expr> {
-        let first = self.assignment()?;
-        if self.is_punct(",") {
-            return Err(self.error("the comma operator is not supported"));
+        let mut expression = self.assignment()?;
+        while self.eat(",") {
+            let line = expression.line;
+            expression = Expr {
+                kind: ExprKind::Binary(",", Box::new(expression), Box::new(self.assignment()?)),
+                line,
+            };
         }
-        Ok(first)
+        Ok(expression)
     }
 
     fn assignment(&mut self) -> Result<Expr> {
@@ -1536,6 +1607,12 @@ impl Parser<'_> {
                 // `metal::` and `access::` qualify names this frontend knows
                 // unqualified.
                 if self.eat("::") {
+                    if word == "component" {
+                        return Ok(Expr {
+                            kind: ExprKind::Ident(format!("component::{}", self.ident()?)),
+                            line,
+                        });
+                    }
                     return self.primary();
                 }
                 if word == "reinterpret_cast" && self.is_punct("<") {

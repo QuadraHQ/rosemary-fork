@@ -768,6 +768,61 @@ pub(crate) unsafe fn set_on_host(
     absent_as_enoattr(rc)
 }
 
+/// Read the attribute the guest calls `name` from the file at the *host* path
+/// `path` into `value`: for a call that has already found the file, such as
+/// `getattrlist` reading Finder info. Answers as `getxattr` does.
+///
+/// # Safety
+///
+/// `path` and `name` are NUL-terminated.
+pub(crate) unsafe fn get_on_host(
+    path: &CStr,
+    name: &CStr,
+    value: &mut [u8],
+    nofollow: bool,
+) -> isize {
+    let Some(host) = (unsafe { host_name(name.as_ptr()) }) else {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    };
+    let options = if nofollow { NOFOLLOW } else { 0 };
+    let file = File::Path(path.as_ptr(), nofollow);
+    // SAFETY: the caller's path, and a buffer of the length given.
+    unsafe {
+        get(
+            file,
+            &host,
+            value.as_mut_ptr().cast(),
+            value.len(),
+            0,
+            options,
+        )
+    }
+}
+
+/// [`get_on_host`] for the file open on `fd`.
+///
+/// # Safety
+///
+/// `name` is NUL-terminated.
+pub(crate) unsafe fn get_on_fd(fd: libc::c_int, name: &CStr, value: &mut [u8]) -> isize {
+    let Some(host) = (unsafe { host_name(name.as_ptr()) }) else {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    };
+    // SAFETY: a descriptor, and a buffer of the length given.
+    unsafe {
+        get(
+            File::Fd(fd),
+            &host,
+            value.as_mut_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    }
+}
+
 /// [`set_on_host`] for the file open on `fd`: the descriptor itself, so the
 /// attribute lands on that file whatever it is now called.
 ///
@@ -971,9 +1026,15 @@ mod tests {
             );
             assert_eq!((got, value[0]), (1, b'7'));
 
-            let mut names = [0u8; 64];
+            // The host may hold attributes of its own, such as macOS's provenance.
+            let mut names = [0u8; 256];
             let listed = flistxattr(fd, names.as_mut_ptr().cast(), names.len(), 0);
-            assert_eq!(&names[..listed as usize], b"com.example.tag\0");
+            assert!(listed > 0);
+            assert!(
+                names[..listed as usize]
+                    .split_inclusive(|&byte| byte == 0)
+                    .any(|listed| listed == b"com.example.tag\0")
+            );
 
             assert_eq!(fremovexattr(fd, name.as_ptr(), 0), 0);
             assert_eq!(

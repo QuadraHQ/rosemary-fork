@@ -21,6 +21,8 @@ macro_rules! isolate_metal_fixture {
     };
 }
 
+mod source_constants;
+
 fn device_for_tests() -> Id {
     bootstrap();
     let target = Box::leak(Box::new(metal_translate::TargetProfile::vulkan_1_3()));
@@ -159,6 +161,9 @@ fn render_pass_attachment_descriptors_keep_native_defaults_after_reset() {
         assign(colors, sel, std::ptr::null_mut(), 0);
         send_with_object(pass, "setDepthAttachment:", std::ptr::null_mut());
         send_with_object(pass, "setStencilAttachment:", std::ptr::null_mut());
+        let color = element_at(colors, 0);
+        let depth = send(pass, "depthAttachment");
+        let stencil = send(pass, "stencilAttachment");
         for (attachment, load, store) in [(color, 0, 1), (depth, 2, 0), (stencil, 2, 0)] {
             assert_eq!(send_number_result(attachment, "loadAction"), load);
             assert_eq!(send_number_result(attachment, "storeAction"), store);
@@ -1256,6 +1261,7 @@ fn triangle_library() -> metal_translate::TranslatedLibrary {
         globals: Vec::new(),
         entries: vec![
             ir::EntryPoint {
+                early_fragment_tests: false,
                 function: 0,
                 stage: ir::Stage::Vertex,
                 resources: Vec::new(),
@@ -1276,6 +1282,7 @@ fn triangle_library() -> metal_translate::TranslatedLibrary {
                 }],
             },
             ir::EntryPoint {
+                early_fragment_tests: false,
                 function: 1,
                 stage: ir::Stage::Fragment,
                 resources: Vec::new(),
@@ -1373,7 +1380,7 @@ fn check_depth_resolve(device: Id) {
         return;
     }
 
-    let library = retain_library(device, triangle_library(), None, vec![0, 0], None);
+    let library = retain_library(device, triangle_library(), None, None);
     // SAFETY: as in `a_translated_triangle_draws_on_the_gpu`.
     let (vertex, fragment) = unsafe {
         (
@@ -1545,7 +1552,7 @@ fn check_depth_resolve(device: Id) {
 /// A render pipeline descriptor drawing `triangle_library`'s triangle into
 /// one BGRA8 target, owned by the caller.
 fn triangle_pipeline_descriptor(device: Id) -> Id {
-    let library = retain_library(device, triangle_library(), None, vec![0, 0], None);
+    let library = retain_library(device, triangle_library(), None, None);
     // SAFETY: a library this test made.
     let (vertex, fragment) = unsafe {
         (
@@ -1707,7 +1714,7 @@ fn a_translated_triangle_draws_on_the_gpu() {
         return;
     };
     const SIZE: u64 = 8;
-    let library = retain_library(device, triangle_library(), None, vec![0, 0], None);
+    let library = retain_library(device, triangle_library(), None, None);
     // SAFETY: a library this test made.
     let (vertex, fragment) = unsafe {
         (
@@ -2393,7 +2400,7 @@ fn recording_cost() {
     };
     objc::arc::pool_pop(pool);
 
-    let library = retain_library(device, triangle_library(), None, vec![0, 0], None);
+    let library = retain_library(device, triangle_library(), None, None);
     // SAFETY: as in `a_translated_triangle_draws_on_the_gpu`.
     let render = unsafe {
         let vertex = new_function_with_name(
@@ -3620,7 +3627,7 @@ fn covering_draw_with_depth(device: Id, depth_format: u64, z: f32) -> Option<Cov
     if !gpu.occlusion_precise {
         return None;
     }
-    let library = retain_library(device, triangle_library(), None, vec![0, 0], None);
+    let library = retain_library(device, triangle_library(), None, None);
     // SAFETY: a library this test made.
     let (vertex, fragment) = unsafe {
         (

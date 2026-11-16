@@ -25,6 +25,10 @@ impl Lowerer<'_, '_> {
     /// Evaluate an expression for its effect alone.
     pub fn effect(&mut self, expr: &Expr) -> Result<()> {
         match &expr.kind {
+            ExprKind::Binary(",", lhs, rhs) => {
+                self.effect(lhs)?;
+                self.effect(rhs)
+            }
             // `discard_fragment()` and other void calls have no value.
             ExprKind::Call { name, args, .. } if name == "discard_fragment" => {
                 if !args.is_empty() || self.stage != Stage::Fragment {
@@ -960,6 +964,10 @@ impl Lowerer<'_, '_> {
     }
 
     fn binary(&mut self, op: &str, lhs: &Expr, rhs: &Expr, line: usize) -> Result<Value> {
+        if op == "," {
+            self.effect(lhs)?;
+            return self.rvalue(rhs);
+        }
         if op == "&&" || op == "||" {
             return self.logical(op, lhs, rhs, line);
         }
@@ -1443,7 +1451,7 @@ impl Lowerer<'_, '_> {
         for (position, (field, value)) in fields.iter().zip(values).enumerate() {
             let value = match value {
                 Some(value) => self.pack(value, &field.ty),
-                None => self.zero(&field.ty, line)?,
+                None => self.context.zero(&field.ty, line)?,
             };
             op = self.emit(
                 ir.clone(),
@@ -1455,33 +1463,6 @@ impl Lowerer<'_, '_> {
             );
         }
         Ok(Value { op, ty: ty.clone() })
-    }
-
-    pub(super) fn zero(&mut self, ty: &Ty, line: usize) -> Result<Operand> {
-        match ty {
-            Ty::Scalar(scalar) => Ok(number_operand(*scalar, Number::Int(0))),
-            Ty::Vector(scalar, lanes) => Ok(self.constant_of(*scalar, *lanes, Number::Int(0))),
-            Ty::Matrix { .. } => Ok(self.construct_matrix(ty, &[], line)?.op),
-            Ty::ByteBool => Ok(number_operand(Scalar::UCHAR, Number::Int(0))),
-            Ty::Packed(scalar, lanes) => {
-                let element = self.zero(&Ty::Scalar(*scalar), line)?;
-                Ok(Operand::Composite {
-                    ty: self.context.ir(ty),
-                    elements: vec![element; usize::from(*lanes)],
-                })
-            }
-            Ty::Array(element, count) => {
-                let element = self.zero(element, line)?;
-                Ok(Operand::Composite {
-                    ty: self.context.ir(ty),
-                    elements: vec![element; *count as usize],
-                })
-            }
-            _ => Err(syntax_error(
-                line,
-                "a field left out of a compound literal must be numeric",
-            )),
-        }
     }
 }
 
@@ -1615,6 +1596,7 @@ pub(super) fn describe(ty: &Ty) -> String {
         Ty::ByteBool => "bool".into(),
         Ty::Param(name) => name.clone(),
         Ty::Array(element, count) => format!("{}[{count}]", describe(element)),
+        Ty::ArrayParam(element, count) => format!("{}[{count}]", describe(element)),
         Ty::Struct(_) => "a structure".into(),
         Ty::Texture(_) => "a texture".into(),
         Ty::Sampler => "a sampler".into(),
