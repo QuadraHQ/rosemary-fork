@@ -167,6 +167,25 @@ pacing report every 900 frames.
 
 ## What has been checked
 
+### 0.5.0-quadra.3 (upstream a7fe540f merged)
+
+Upstream's 90 commits since 0.5.0-quadra.2 merged with one conflict: the tests
+both sides added to `tests/dyld_insert.rs`, which now holds both sets. The fork's
+host bridge, forced insertion and global `dlsym` over the program's dylibs sit
+beside upstream's new launch-time image list without changes.
+
+* `cargo build --release --bin rosemary` builds on x86-64 Linux with nightly
+  1.102.
+* `tests/dyld_insert.rs` (8, upstream's
+  `inserted_library_sees_the_programs_dependencies` among them) and
+  `tests/hostbridge.rs` (3) ran and passed, with fixtures built by a `cc`
+  stand-in around clang and `ld64.lld` against Quadra's VR `libSystem.tbd` with
+  `-undefined dynamic_lookup`.
+
+Not run in game and not with a headset or the Monado emulator for this release.
+Roblox 0.748 moved `DeviceVR`'s methods from `createResources` on by three
+slots; that is handled in Quadra's VR library, not here.
+
 ### 0.5.0-quadra.2 (upstream 0b081874 merged)
 
 Roblox 0.746.0.7461264 on x86-64 Linux with an NVIDIA RTX 3060 Ti (driver
