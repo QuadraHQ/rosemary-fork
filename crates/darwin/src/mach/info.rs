@@ -222,7 +222,7 @@ fn own_sizes(regions: bool) -> Option<Usage> {
 fn region_count() -> u32 {
     let _host = crate::syscall::ScopedHostSyscallContext::new();
 
-    starnix::process::regions().map_or(0, |regions| regions.len() as u32)
+    starnix::process::region_count(starnix::process::me()).unwrap_or(0)
 }
 
 /// Resident memory the task does not share with another, which is the
@@ -841,6 +841,10 @@ mod tests {
     /// The four fields a caller works "available memory" out of, read at the
     /// offsets it reads them at rather than through this file's own structure.
     #[test]
+    #[cfg_attr(
+        target_os = "freebsd",
+        ignore = "FreeBSD keeps no machine-wide count of file-backed pages"
+    )]
     fn the_wide_vm_statistics_answer_what_available_memory_is_computed_from() {
         let mut info = [0u8; size_of::<VmStatistics64>()];
         let mut count = (info.len() / 4) as u32;
