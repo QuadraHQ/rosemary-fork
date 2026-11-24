@@ -7,6 +7,9 @@
 //! queries need no context and live here.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use static_init::dynamic;
 
 use appkit::opengl as context;
 
@@ -20,6 +23,8 @@ const K_CGL_BAD_PROPERTY: CGLError = 10001;
 const K_CGL_BAD_RENDERER_INFO: CGLError = 10003;
 /// `kCGLBadValue`: a null out-parameter.
 const K_CGL_BAD_VALUE: CGLError = 10008;
+
+const BYTES_PER_MEGABYTE: u64 = 1 << 20;
 
 /// `CGLRendererProperty`, in the numbering `<OpenGL/CGLRenderers.h>` gives.
 mod property {
@@ -197,15 +202,13 @@ pub unsafe extern "C" fn CGLDescribeRenderer(
         // `kCGLSupersampleBit | kCGLMultisampleBit`.
         property::SAMPLE_MODES => 3,
         property::SAMPLE_ALPHA => 1,
-        property::VIDEO_MEMORY | property::TEXTURE_MEMORY => match memory_bytes() {
-            Some(bytes) => bytes,
-            None => return K_CGL_BAD_PROPERTY,
-        },
+        // `GLint`, so a card with more than two gigabytes saturates here;
+        // the megabyte properties exist for the callers that want the rest.
+        property::VIDEO_MEMORY | property::TEXTURE_MEMORY => {
+            i32::try_from(memory_bytes()).unwrap_or(i32::MAX)
+        }
         property::VIDEO_MEMORY_MEGABYTES | property::TEXTURE_MEMORY_MEGABYTES => {
-            match memory_bytes() {
-                Some(bytes) => bytes >> 20,
-                None => return K_CGL_BAD_PROPERTY,
-            }
+            i32::try_from(memory_bytes() >> 20).unwrap_or(i32::MAX)
         }
         _ => return K_CGL_BAD_PROPERTY,
     };
@@ -214,53 +217,73 @@ pub unsafe extern "C" fn CGLDescribeRenderer(
     K_CGL_NO_ERROR
 }
 
-/// The GPU's memory in bytes, as the driver reports it, or `None` where it
-/// does not.
+/// The GPU's memory in bytes.
 ///
 /// There is no portable GL query for this - Apple answers it from the kernel's
-/// own device tree, which is not a thing this host has - so it comes from
-/// whichever vendor extension the driver carries, and from nothing at all when
-/// neither is there. Only with a context current: `glGetIntegerv` without one
-/// is undefined, and asking is how a caller finds out there is no GPU yet
-/// rather than a GPU with no memory.
-///
-/// Capped at `GLint`, which is the type the property is read back as: a card
-/// with more than two gigabytes would otherwise be reported as a negative
-/// number.
-fn memory_bytes() -> Option<i32> {
+/// own device tree - so it comes from, in order: `ROSEMARY_VIDEO_MEMORY_MB`, a
+/// vendor extension of the current context, the DRM driver's sysfs, and last
+/// the share of system memory a GPU without dedicated memory can use. Asking a
+/// driver needs a context current: `glGetIntegerv` without one is undefined.
+fn memory_bytes() -> u64 {
     // The last driver answer, since the question is often asked before any
     // context exists - a launcher checking the hardware before the game makes
     // one - and a GPU's memory does not change between contexts.
-    static LAST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    if let Some(bytes) = memory_from_environment() {
+        return bytes;
+    }
     if let Some(bytes) = memory_from_driver() {
-        LAST.store(bytes, std::sync::atomic::Ordering::Relaxed);
-        return Some(bytes);
+        LAST.store(bytes, Ordering::Relaxed);
+        return bytes;
     }
-    match LAST.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => memory_from_sysfs(),
-        bytes => Some(bytes),
+    match LAST.load(Ordering::Relaxed) {
+        0 => memory_from_sysfs().unwrap_or_else(memory_shared_with_system),
+        bytes => bytes,
     }
+}
+
+/// `ROSEMARY_VIDEO_MEMORY_MB`: what the user says the GPU has, for a driver
+/// that cannot say so itself.
+fn memory_from_environment() -> Option<u64> {
+    #[dynamic]
+    static OVERRIDE: Option<u64> = std::env::var("ROSEMARY_VIDEO_MEMORY_MB")
+        .ok()
+        .and_then(|megabytes| megabytes_to_bytes(&megabytes));
+    *OVERRIDE
+}
+
+fn megabytes_to_bytes(text: &str) -> Option<u64> {
+    let megabytes = text.trim().parse::<u64>().ok().filter(|&m| m > 0)?;
+    megabytes.checked_mul(BYTES_PER_MEGABYTE)
 }
 
 /// With no context: the largest dedicated memory a DRM driver reports, which
 /// amdgpu and xe publish as `mem_info_vram_total`, in bytes.
-fn memory_from_sysfs() -> Option<i32> {
+fn memory_from_sysfs() -> Option<u64> {
     if !cfg!(target_os = "linux") {
         return None;
     }
     let cards = std::fs::read_dir("/sys/class/drm").ok()?;
-    let largest = cards
+    cards
         .filter_map(Result::ok)
         .filter_map(|card| {
             std::fs::read_to_string(card.path().join("device/mem_info_vram_total")).ok()
         })
         .filter_map(|text| text.trim().parse::<u64>().ok())
-        .max()?;
-    Some(i32::try_from(largest).unwrap_or(i32::MAX))
+        .max()
+}
+
+/// A GPU with no memory of its own - an integrated one, which i915 is - draws
+/// from system memory, so its video memory is the part of that it may take.
+///
+/// FIXME (ACCURACY): half of physical memory is the conventional share, not
+/// what the driver would actually grant.
+fn memory_shared_with_system() -> u64 {
+    starnix::system::physical_memory() / 2
 }
 
 /// The current context's driver, through a vendor extension.
-fn memory_from_driver() -> Option<i32> {
+fn memory_from_driver() -> Option<u64> {
     /// `GL_GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX`, in kilobytes.
     const NVX_DEDICATED_VIDMEM: u32 = 0x9047;
     /// `GL_TEXTURE_FREE_MEMORY_ATI`, whose first word is the free pool in
@@ -285,10 +308,10 @@ fn memory_from_driver() -> Option<i32> {
     } else {
         return None;
     };
-    if kilobytes <= 0 {
-        return None;
-    }
-    Some(i32::try_from(i64::from(kilobytes) * 1024).unwrap_or(i32::MAX))
+    u64::try_from(kilobytes)
+        .ok()
+        .filter(|&kilobytes| kilobytes > 0)
+        .map(|kilobytes| kilobytes * 1024)
 }
 
 /// `CGLError CGLDestroyRendererInfo(CGLRendererInfoObj rend)`
@@ -382,6 +405,33 @@ mod tests {
             unsafe { CGLDestroyRendererInfo(rend) },
             K_CGL_BAD_RENDERER_INFO
         );
+    }
+
+    #[test]
+    fn video_memory_override_is_whole_positive_megabytes() {
+        assert_eq!(megabytes_to_bytes(" 2048\n"), Some(2048 << 20));
+        for refused in ["0", "-1", "2g", "", "18446744073709551615"] {
+            assert_eq!(megabytes_to_bytes(refused), None, "{refused:?}");
+        }
+    }
+
+    /// A GPU past two gigabytes still reads as a positive count of megabytes,
+    /// and one the driver cannot size is not left unanswered.
+    #[test]
+    fn video_memory_is_always_answered() {
+        let mut rend = std::ptr::null_mut();
+        let mut count = 0;
+        // SAFETY: two writable out-parameters.
+        unsafe { CGLQueryRendererInfo(1, &mut rend, &mut count) };
+        for prop in [property::VIDEO_MEMORY, property::VIDEO_MEMORY_MEGABYTES] {
+            let mut value = 0;
+            // SAFETY: a live object and a writable word.
+            let error = unsafe { CGLDescribeRenderer(rend, 0, prop, &mut value) };
+            assert_eq!(error, K_CGL_NO_ERROR, "property {prop}");
+            assert!(value > 0, "property {prop}");
+        }
+        // SAFETY: the object made above.
+        unsafe { CGLDestroyRendererInfo(rend) };
     }
 
     /// A renderer past the end of the list, and an object nothing made, are
