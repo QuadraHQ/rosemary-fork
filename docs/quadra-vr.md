@@ -167,6 +167,15 @@ pacing report every 900 frames.
 
 ## What has been checked
 
+### 0.5.0-quadra.4 (video memory query)
+
+`CGLDescribeRenderer` now always answers the video memory properties, so a GPU
+with no dedicated memory (an Intel iGPU on i915) no longer leaves Roblox on its
+64 MiB fallback. `ROSEMARY_VIDEO_MEMORY_MB` overrides the answer.
+
+* `cargo test --release -p opengl cgl` passes (5, two new).
+* Not run in game and not on the reporter's Intel HD 4400 (Quadra#42).
+
 ### 0.5.0-quadra.3 (upstream a7fe540f merged)
 
 Upstream's 90 commits since 0.5.0-quadra.2 merged with one conflict: the tests
