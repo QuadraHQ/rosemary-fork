@@ -40,6 +40,13 @@ pub fn page_size() -> u64 {
     (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(4096) as u64
 }
 
+/// Installed physical memory in bytes, or zero where the host will not say.
+pub fn physical_memory() -> u64 {
+    // SAFETY: `sysconf` only reads its argument.
+    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    u64::try_from(pages).unwrap_or(0) * page_size()
+}
+
 pub fn memory() -> Memory {
     sys::memory()
 }
