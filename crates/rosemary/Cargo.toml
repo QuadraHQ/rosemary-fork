@@ -31,6 +31,7 @@ security.workspace = true
 gamecontroller.workspace = true
 webkit.workspace = true
 coreanalytics.workspace = true
+coremidi.workspace = true
 forcefeedback.workspace = true
 network.workspace = true
 opencl.workspace = true
@@ -44,7 +45,7 @@ libc.workspace = true
 static_init.workspace = true
 clap = { version = "4", features = ["derive"] }
 iced-x86 = "1"
-microlift = { git = "https://github.com/microlift/microlift", features = ["disasm", "runtime"], rev = "ef03e1f07f8c103f4bc3a59057d0a63c2efe8133" }
+microlift = { git = "https://github.com/microlift/microlift", features = ["disasm", "runtime"], rev = "c74fa6582903514b45d50886611b9a89eb4f49e7" }
 # `override` feature disabled on macOS for now because it has a bug where it improperly sets `_malloc_fork` info,
 # causing child processes to get their memory allocator corrupted.
 [target.'cfg(target_os = "macos")'.dependencies]

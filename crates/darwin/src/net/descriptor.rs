@@ -1,15 +1,12 @@
 /// `int close(int fd)`
 pub unsafe extern "C" fn close(fd: i32) -> i32 {
-    // Before the host close frees the number: another thread's `kqueue` can be
-    // handed it at once, and must not lose its new queue here.
+    // Before the host close frees the number: another thread can be handed it
+    // at once, and must neither lose its new state here nor find this one's.
     crate::kqueue::forget(fd);
+    super::sockopt::forget(fd);
+    crate::attrlist::forget(fd);
     // SAFETY: an integer descriptor; the call touches no caller memory.
-    let rc = unsafe { libc::close(fd) };
-    if rc == 0 || crate::errno::get() == libc::EBADF {
-        super::sockopt::forget(fd);
-        crate::attrlist::forget(fd);
-    }
-    rc
+    unsafe { libc::close(fd) }
 }
 
 /// `int dup(int fd)`
@@ -17,7 +14,7 @@ pub(crate) unsafe extern "C" fn dup(fd: i32) -> i32 {
     // SAFETY: an integer descriptor; the call touches no caller memory.
     let copied = unsafe { libc::dup(fd) };
     if copied >= 0 {
-        super::sockopt::inherit_sigpipe_suppression(fd, copied);
+        super::sockopt::inherit(fd, copied);
         crate::kqueue::duplicate(fd, copied);
     }
     copied
@@ -32,7 +29,7 @@ pub(crate) unsafe extern "C" fn dup2(from: i32, to: i32) -> i32 {
         crate::attrlist::forget(to);
     }
     if copied >= 0 {
-        super::sockopt::inherit_sigpipe_suppression(from, copied);
+        super::sockopt::inherit(from, copied);
         crate::kqueue::duplicate(from, copied);
     }
     copied

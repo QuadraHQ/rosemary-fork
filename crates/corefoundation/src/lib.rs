@@ -115,6 +115,15 @@ exports::exports! {
         "CFSetGetTypeID" => api::CFSetGetTypeID,
         "CFSetApplyFunction" => api::CFSetApplyFunction,
         "CFSetGetCount" => api::CFSetGetCount,
+        "CFSetCreate" => api::CFSetCreate,
+        "CFSetCreateMutable" => api::CFSetCreateMutable,
+        "CFSetCreateCopy" => api::CFSetCreateCopy,
+        "CFSetCreateMutableCopy" => api::CFSetCreateMutableCopy,
+        "CFSetAddValue" => api::CFSetAddValue,
+        "CFSetRemoveValue" => api::CFSetRemoveValue,
+        "CFSetRemoveAllValues" => api::CFSetRemoveAllValues,
+        "CFSetContainsValue" => api::CFSetContainsValue,
+        "CFSetGetValue" => api::CFSetGetValue,
         "CFSetGetValues" => api::CFSetGetValues,
         "CFDictionaryCreate" => api::CFDictionaryCreate,
         "CFDictionaryGetCountOfKey" => api::CFDictionaryGetCountOfKey,
@@ -148,6 +157,7 @@ exports::exports! {
         "CFTimeZoneCreateWithName" => timezone::create_with_name,
         "CFTimeZoneCreateWithTimeIntervalFromGMT" => timezone::create_with_time_interval_from_gmt,
         "CFTimeZoneGetName" => timezone::get_name,
+        "CFTimeZoneGetSecondsFromGMT" => timezone::get_seconds_from_gmt,
         "CFURLCreateFromFSRef" => api::CFURLCreateFromFSRef,
         "CFURLGetFSRef" => api::CFURLGetFSRef,
         "CFURLCreateBookmarkData" => api::CFURLCreateBookmarkData,
@@ -187,6 +197,7 @@ exports::exports! {
         "CFRunLoopSourceIsValid" => api::CFRunLoopSourceIsValid,
         "CFRunLoopAddSource" => api::CFRunLoopAddSource,
         "CFRunLoopObserverCreate" => api::CFRunLoopObserverCreate,
+        "CFRunLoopObserverCreateWithHandler" => api::CFRunLoopObserverCreateWithHandler,
         "CFRunLoopObserverInvalidate" => api::CFRunLoopObserverInvalidate,
         "CFRunLoopObserverIsValid" => api::CFRunLoopObserverIsValid,
         "CFRunLoopObserverGetOrder" => api::CFRunLoopObserverGetOrder,
@@ -216,6 +227,9 @@ exports::exports! {
         "CFRunLoopRemoveSource" => api::CFRunLoopRemoveSource,
         "CFRunLoopContainsSource" => api::CFRunLoopContainsSource,
         "CFRunLoopTimerCreate" => api::CFRunLoopTimerCreate,
+        "CFRunLoopTimerCreateWithHandler" => api::CFRunLoopTimerCreateWithHandler,
+        "CFRunLoopTimerGetTolerance" => api::CFRunLoopTimerGetTolerance,
+        "CFRunLoopTimerSetTolerance" => api::CFRunLoopTimerSetTolerance,
         "CFRunLoopTimerGetContext" => api::CFRunLoopTimerGetContext,
         "CFRunLoopAddTimer" => api::CFRunLoopAddTimer,
         "CFRunLoopRemoveTimer" => api::CFRunLoopRemoveTimer,
@@ -1480,6 +1494,32 @@ mod collection_tests {
                 assert_eq!(api::CFNumberGetByteSize(object), 1);
                 assert_eq!(api::CFNumberIsFloatType(object), 0);
             }
+        }
+    }
+
+    /// A set with no callbacks compares its members by address, and keeps one
+    /// of each.
+    #[test]
+    fn a_mutable_set_keeps_one_of_each_member() {
+        bootstrap();
+        let (a, b) = (0x1000 as CFTypeRef, 0x2000 as CFTypeRef);
+        // SAFETY: a set this test owns, with no callbacks to call.
+        unsafe {
+            let set = api::CFSetCreateMutable(std::ptr::null(), 0, std::ptr::null());
+            api::CFSetAddValue(set, a);
+            api::CFSetAddValue(set, a);
+            api::CFSetAddValue(set, b);
+            assert_eq!(api::CFSetGetCount(set), 2);
+            assert_eq!(api::CFSetContainsValue(set, a), 1);
+            api::CFSetRemoveValue(set, a);
+            assert_eq!(api::CFSetContainsValue(set, a), 0);
+            assert_eq!(api::CFSetGetValue(set, b), b);
+            let copy = api::CFSetCreateCopy(std::ptr::null(), set);
+            api::CFSetRemoveAllValues(set);
+            assert_eq!(api::CFSetGetCount(set), 0);
+            assert_eq!(api::CFSetGetCount(copy), 1);
+            api::CFRelease(copy);
+            api::CFRelease(set);
         }
     }
 

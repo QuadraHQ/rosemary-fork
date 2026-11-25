@@ -59,8 +59,10 @@ fn service_presentation() {
 }
 
 /// Keep completed host presentation moving without delivering guest input or
-/// running the general callbacks, which may call back into guest code.
-pub(crate) fn service_modal_presentation() {
+/// running the general callbacks, which may call back into guest code. For a
+/// video thread that is inside guest code and cannot return to the pump: a
+/// modal loop, or a wait on a presentation.
+pub fn service_presentation_only() {
     service_presentation();
     // Copy before callbacks, since these can reenter the modal loop.
     let hooks = MODAL_PRESENTATION_HOOKS
@@ -1957,6 +1959,7 @@ fn delegate_selector(name: &str) -> &'static str {
         "NSWindowWillMiniaturizeNotification" => "windowWillMiniaturize:",
         "NSWindowWillMoveNotification" => "windowWillMove:",
         "NSWindowDidChangeOcclusionStateNotification" => "windowDidChangeOcclusionState:",
+        "NSWindowDidUpdateNotification" => "windowDidUpdate:",
         other => objc::fail!("appkit::event: {other} has no delegate method in this table"),
     }
 }

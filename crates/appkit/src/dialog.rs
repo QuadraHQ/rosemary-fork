@@ -167,7 +167,7 @@ impl Dialog {
         }
 
         let transparent = sdl3::video::is_wayland();
-        let alert = Alert {
+        let mut alert = Alert {
             message: request.message.clone(),
             informative: request.informative.clone(),
             rich_informative: request.rich_informative.clone(),
@@ -210,6 +210,10 @@ impl Dialog {
             }
             return None;
         };
+        if !transparent {
+            alert.rounded =
+                sdl3::video::round_corners(window, f64::from(theme.alert_corner_radius));
+        }
         let parent = parent();
         if modal && !parent.is_null() {
             sdl3::video::set_window_modal_for(window, parent);
@@ -632,7 +636,7 @@ fn modal_loop(dialog: &mut Dialog) -> (usize, bool) {
         crate::script::run();
         // Modal input restrictions do not suspend SDL surface creation or
         // completion of Metal readbacks on the video thread.
-        crate::event::service_modal_presentation();
+        crate::event::service_presentation_only();
         let scripted = MODAL.with_borrow_mut(|modal| modal.as_mut()?.1.pop_front());
         let Some(event) = scripted.or_else(|| sdl3::video::wait(50)) else {
             continue;

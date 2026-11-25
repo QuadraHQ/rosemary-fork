@@ -43,6 +43,14 @@ already have a cache file alone; `--refresh` builds images with no cache file an
 rebuilds the first part of those whose runs have outgrown it, which is what a
 background build does.
 
+On a terminal, `rosemary aot` draws a live panel on standard error: each image's
+progress (start-up regions in orange, the rest in blue), the entry points still
+being discovered, what each compiler thread is lifting or compiling and how its
+time is split, and an estimate of the time left. Its last frame stays as a
+summary. `--no-progress` turns it off; it is never drawn when standard error is
+not a terminal, under `--detach`, or with `TERM=dumb`, and `NO_COLOR` drops
+its colours.
+
 ## Entering a shell
 
 Rosemary ships a full MiniDarwin base system, including basic utilities like `bash` and `zsh`.
@@ -93,9 +101,10 @@ ROSEMARY_DESKTOP=1600x900 rosemary desktop --foreground
 | --- | ------- | ----------- |
 | `ROSEMARY_OBJC` | `native` (macOS), `builtin` (other) | Set the Objective-C runtime implementation to use. On Linux, there is only `builtin`. On macOS, `native` uses the real Objective-C, and `builtin` uses the compatibility implementation which can only talk to cross platform reimplementations. `native` yields better compatibility and performance, so use it if you can. It is only recommended you use `builtin` if you are differentially testing, or working upon the compatibility layer from a real macOS system. Make sure that if you're on macOS you also set `ROSEMARY_BUNDLED=1`. |
 | `ROSEMARY_BUNDLED` | `0` | (macOS only) - determines if Rosemary should re-execute from a virtual repackage of the application. Makes the real Objective-C runtime recognize plist registrations, unnecessary with `builtin` (and possibly problematic). |
+| `ROSEMARY_GUI` | `0` | (macOS only) Turn on the built in GUI and its hotkeys. See the GUI section. `ROSEMARY_GUI_OPEN=1` also shows it from the first frame. |
 | `ROSEMARY_LIBC` | `native` (macOS), `builtin` (other) | Select the libc shim implementation for guest imports. Guest-aware default modules remain active in both modes. |
 | `ROSEMARY_DEAD_FLAGS` | `0` | Enable Microlift's dead flag elimination pass. Improves performance in some applications, but not by a wide enough margin. **May have semantic accuracy bugs, use with extreme caution**. |
-| `ROSEMARY_TSO` | `1` (non-x86 hosts), `0` (x86 hosts) | Fence guest memory accesses so an AArch64 host keeps x86's total store order. Without it, lock-free guest code that publishes data with plain stores (Mono's class setup, for one) can see another thread's writes out of order; Subnautica aborts in Mono on `ac->rank` while loading the world. Costs a `dmb` on most guest memory accesses. |
+| `ROSEMARY_TSO` | `1` (non-x86 hosts), `0` (x86 hosts) | Fence guest memory accesses so an AArch64 host keeps x86's total store order. Without it, lock-free guest code that publishes data with plain stores (Mono's class setup, for one) can see another thread's writes out of order; Subnautica aborts in Mono on `ac->rank` while loading the world. Where the host can run a thread under total store order in hardware (Apple silicon on an Asahi Linux kernel with `PR_SET_MEM_MODEL`), every guest thread does so and no fences are emitted; otherwise it costs a `dmb` on most guest memory accesses. macOS offers no way to ask for the hardware mode outside Rosetta. |
 | `ROSEMARY_PROC_TRANSLATED` | `1` | (emulated) Tell an x86-64 guest it runs under Rosetta 2, as on an Apple silicon Mac: `sysctl.proc_translated` reads 1, and the commpage and the process's `P_TRANSLATED` flag say so too. Set to `0` to hide all three, as on an Intel Mac. A program that chooses what to download by architecture, such as Roblox's installer, otherwise fetches an arm64-only build, which an x86-64 host cannot run. |
 | `ROSEMARY_CALL_RETURN` | `0` | Enable Microlift native call return support. Can improve performance in some applications - disabled by default as measurements were inconclusive and it is additional, complex code surface. |
 | `ROSEMARY_NO_JIT_TIERS` | `0` | (emulated) Compile every region at its final optimisation level from the start. By default a region is first compiled cheaply (Cranelift's `opt_level=none` and single-pass register allocation, about twice as fast to compile and half as fast to run), and worker threads recompile it at the final level and swap the new code in. Start-up is mostly compiling code that runs a handful of times, so tiering roughly halves it, and the code still running after start-up ends up as fast as before. A loop that never leaves the region it entered keeps the cheap code until it does. |
@@ -146,7 +155,9 @@ ROSEMARY_DESKTOP=1600x900 rosemary desktop --foreground
 | `ROSEMARY_EXE` | (set by the launcher) | The path that starts another copy of Rosemary. Under the bundled glibc the kernel reports the bundled dynamic loader as this process's executable, so the runtime re-launches itself (`rosemary server`, a guest spawning a Mach-O) through this instead. |
 | `ROSEMARY_METAL_BACKEND` | `vulkan` | Experimental: set to `native` on macOS to return guest-wrapped devices and basic resources backed by the host Metal framework, while retaining `ROSEMARY_OBJC=builtin`. The experimental backend supports native device discovery, queues, buffers, textures, samplers, texture copies and mipmap generation, source-MSL shaders, precompiled `.metallib` dispatch-data loading, compute and render pipelines, vertex descriptors, color blending, depth/stencil state, texture/sampler bindings, indexed drawing, rasterization state, asynchronous command-buffer completion handlers, and guest `CAMetalLayer` drawables. A full-window SDL Metal view is attached by AppKit's video-thread pump when available. This is **not** a complete Metal implementation: shader specialization, all texture formats and advanced rendering operations, complete window/layer composition, and other API surfaces remain incomplete. Roblox 0.747 has successfully joined Crossroads and DOORS, and GPU readbacks verified actual world and UI rendering; a DOORS-lobby Metal HUD comparison measured roughly native performance on Apple M2. Extended interactive gameplay, long-running stability, and broad application compatibility are **not yet verified**; use this mode for research, not production. The existing Metal-to-Vulkan translator remains the default even on macOS. |
 | `ROSEMARY_METAL_PRESENTATION_MODE` | unset | Set the presentation mode used by Vulkan in Rosemary's Metal translation. Valid values are `immediate`, `fifo`, `fifo_relaxed`, and `mailbox`. |
+| `ROSEMARY_METAL_MAP_MIX_TO_FMIX` | unset | Map Metal's mix() to SPIR-V's fmix() operation directly, which trades floating point precision for performance. This is an **inaccurate** optimization, however, most applications will render perfectly fine with it. Ensure this option is disabled when writing bug reports on Metal applications. |
 | `ROSEMARY_SHADER_CACHE` | `$XDG_CACHE_HOME/rosemary/metal-shaders` | Where Metal shaders translated to SPIR-V are cached, together with each GPU's Vulkan pipeline cache (`pipelines-<vendor>-<device>-<uuid>.bin`), so a second run neither retranslates shaders nor recompiles pipelines. Falls back to `$HOME/.cache/rosemary/metal-shaders`. Each build of the translator keeps its own subdirectory and removes the others; `ROSEMARY_SHADER_CACHE_KEEP` keeps them. Set to `off`, `0` or the empty string to disable both caches. |
+| `ROSEMARY_REGION_COUNT_REUSE` | unset | (FreeBSD) Reuse the count of memory regions that `task_info(TASK_VM_INFO)` and the process's own information report, for up to a second. FreeBSD only counts them through `kern.proc.vmmap`, which also counts every region's resident pages while it holds the process's map lock: tens of milliseconds in a game's address space, during which its other threads cannot map memory, and some engines ask several times a second. Any value but `0` turns it on. Off by default because the count can then be up to a second out of date. |
 | `ROSEMARY_SCREEN_REFRESH_RATE` | unset | Hertz that guests are told the display refreshes at, in place of the host's mode: `NSScreen`/`UIScreen` `maximumFramesPerSecond` and the refresh-interval properties. |
 | `ROSEMARY_EXPOSE_LIBSYSTEM_EXTENSIONS` | unset | Whether to enable Rosemary specific extensions useful for implementing out of tree features to Rosemary. Disabled by default for full environment accuracy. Set to `1` to enable it - See `crates/darwin/src/rosemary/mod.rs` for more details. |
 
@@ -190,6 +201,14 @@ libraries as it would on a Mac, and the Swift half of Foundation (`Data`, `URL`,
 runtime's Foundation re-exports when the built-in Objective-C runtime is in use.
 In a prefix whose base predates it, those imports are unbound.
 
+libSystem is the other. Under the built-in libc it re-exports two of the base's
+own images as Apple's libSystem does: `libcopyfile.dylib`, and configd's client
+library `libsystem_configuration.dylib`, which is how libresolv asks for the
+DNS configuration. Apple never released libxpc, so XPC is this runtime's, over
+its Mach ports: a guest's `xpc_connection_create_mach_service` reaches a
+listener in any other guest of the same user, and either side's death reaches
+the other as `XPC_ERROR_CONNECTION_INTERRUPTED` or `XPC_ERROR_CONNECTION_INVALID`.
+
 A new prefix gets its base when it is created, and nothing is downloaded
 without consent: `rosemary run` asks with a dialog or on the terminal, and
 `ROSEMARY_PREFIX_SETUP` answers in advance. The download (about 2 MB) is
@@ -231,7 +250,7 @@ see which one is wrong.
 
 ## GUI
 
-On macOS with native Objective C, Rosemary has a built in GUI that can be toggled with `SHIFT` + `F7`. This GUI shows the framerate of the application, and has various profiling utilities built in, useful for narrowing down performance bottlenecks.
+On macOS, Rosemary has a built in GUI drawn over the guest's Metal or OpenGL frames, with either Objective-C runtime. It is off unless `ROSEMARY_GUI=1` is set; once on, `SHIFT` + `F7` shows or hides it. It shows the framerate of the application and has various profiling utilities built in, useful for narrowing down performance bottlenecks. `SHIFT` + `F8` gives it the mouse, and `SHIFT` + `F6`, `F9` and `F10` start an Instruments recording, region-entry counting and sampling. Under `ROSEMARY_OBJC=builtin` the hotkeys arrive only while the guest's window has the keyboard.
 
 ## Execution modes
 

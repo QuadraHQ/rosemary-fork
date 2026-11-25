@@ -91,6 +91,7 @@ mod tab;
 mod table;
 pub mod text;
 pub mod textinput;
+mod transaction;
 mod transform;
 pub mod uchr;
 pub mod view;
@@ -150,6 +151,7 @@ pub fn bootstrap() {
         bezier::install();
         layer::install();
         coreanimation::install();
+        transaction::install();
         text::install();
         label::install();
         // Last of the controls (text fields and labels included): a cell
@@ -488,6 +490,8 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     "NSWindowWillMiniaturizeNotification",
     "NSWindowWillMoveNotification",
     "NSWindowDidChangeOcclusionStateNotification",
+    // Posted by AppKit after every -[NSWindow update]; nothing calls that here.
+    "NSWindowDidUpdateNotification",
     // Observed by Gecko's widget layer; no tint change, menu action broadcast
     // or global frame tracking posts them here.
     "NSControlTintDidChangeNotification",
@@ -505,7 +509,10 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     // Observed by Qt's Cocoa platform plugin; no menu tracking or other
     // application's activation posts them here.
     "NSMenuDidBeginTrackingNotification",
+    "NSMenuDidEndTrackingNotification",
     "NSWorkspaceDidActivateApplicationNotification",
+    // Observed by Max; nothing hides the application here.
+    "NSApplicationWillUnhideNotification",
     // Keys and option names whose text is their own name.
     "NSApplicationLaunchUserNotificationKey",
     "NSAccessibilityException",
@@ -570,6 +577,8 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ),
     ("_kUTTypeImage", "public.image"),
     ("_kUTTypeMovie", "public.movie"),
+    ("_kUTTypeAudio", "public.audio"),
+    ("_kUTTypeMP3", "public.mp3"),
     ("_kUTTypePNG", "public.png"),
     ("_kUTTypeURL", "public.url"),
     ("_kUTTypePlainText", "public.plain-text"),
@@ -879,6 +888,41 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
         "AXSecureTextField",
     ),
     ("_NSAccessibilityTabButtonSubrole", "AXTabButton"),
+    ("_NSAccessibilityDialogSubrole", "AXDialog"),
+    ("_NSAccessibilityOutlineRowSubrole", "AXOutlineRow"),
+    ("_NSAccessibilitySwitchSubrole", "AXSwitch"),
+    ("_NSAccessibilityUnknownSubrole", "AXUnknown"),
+    ("_NSAccessibilityCloseButtonSubrole", "AXCloseButton"),
+    ("_NSAccessibilityMinimizeButtonSubrole", "AXMinimizeButton"),
+    (
+        "_NSAccessibilityFullScreenButtonSubrole",
+        "AXFullScreenButton",
+    ),
+    ("_NSAccessibilityStandardWindowSubrole", "AXStandardWindow"),
+    ("_NSAccessibilityFloatingWindowSubrole", "AXFloatingWindow"),
+    ("_NSAccessibilityTableRowSubrole", "AXTableRow"),
+    ("_NSAccessibilityToggleSubrole", "AXToggle"),
+    ("_NSAccessibilityCreatedNotification", "AXCreated"),
+    (
+        "_NSAccessibilityWindowCreatedNotification",
+        "AXWindowCreated",
+    ),
+    ("_NSAccessibilityUIElementsKey", "AXUIElementsKey"),
+    (
+        "_NSAccessibilityDisclosureTriangleRole",
+        "AXDisclosureTriangle",
+    ),
+    ("_NSAccessibilityLevelIndicatorRole", "AXLevelIndicator"),
+    (
+        "_NSAccessibilityLayoutChangedNotification",
+        "AXLayoutChanged",
+    ),
+    ("_NSAccessibilityRowCollapsedNotification", "AXRowCollapsed"),
+    ("_NSAccessibilityRowExpandedNotification", "AXRowExpanded"),
+    (
+        "_NSAccessibilityRowCountChangedNotification",
+        "AXRowCountChanged",
+    ),
     ("_NSAccessibilityDecrementAction", "AXDecrement"),
     ("_NSAccessibilityIncrementAction", "AXIncrement"),
     ("_NSAccessibilityRaiseAction", "AXRaise"),

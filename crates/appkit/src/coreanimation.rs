@@ -121,6 +121,8 @@ struct Node {
     opacity: f64,
     /// `-cornerRadius`, in points.
     corner_radius: f64,
+    /// `-zPosition`, which orders this layer among its siblings when drawn.
+    z_position: f64,
     /// Metadata affecting CA sublayers may alter an ancestor's raster image,
     /// even though that sublayer's own opacity is a scene-only property.
     metadata_revision: u64,
@@ -155,6 +157,7 @@ impl Default for Node {
             hidden: false,
             opacity: 1.0,
             corner_radius: 0.0,
+            z_position: 0.0,
             metadata_revision: 0,
             animations: Vec::new(),
             contents: 0,
@@ -655,6 +658,15 @@ pub(crate) fn scene_animation_roots(now: f64) -> Vec<usize> {
     active
 }
 
+/// `sublayers` in the order they are drawn: by `zPosition`, and in array
+/// order among equals, as Core Animation draws them.
+fn drawing_order(nodes: &HashMap<usize, Node>, sublayers: &[usize]) -> Vec<usize> {
+    let z = |layer: &usize| nodes.get(layer).map_or(0.0, |node| node.z_position);
+    let mut ordered = sublayers.to_vec();
+    ordered.sort_by(|a, b| z(a).total_cmp(&z(b)));
+    ordered
+}
+
 fn read_all_nodes<T>(f: impl FnOnce(&HashMap<usize, Node>) -> T) -> T {
     let nodes = NODES.lock().unwrap_or_else(|e| e.into_inner());
     match nodes.as_ref() {
@@ -687,12 +699,30 @@ unsafe extern "C" fn set_frame(receiver: Id, _sel: Sel, frame: NSRect) {
     bounds.size = frame.size;
     crate::layer::set_bounds_of(receiver, bounds);
     with_node(receiver, |node| {
-        node.position = NSPoint {
-            x: frame.origin.x + node.anchor.x * frame.size.width,
-            y: frame.origin.y + node.anchor.y * frame.size.height,
-        };
+        node.position = anchored(frame, node.anchor)
     });
     changed(receiver);
+}
+
+/// Where a layer whose frame is `frame` has its position.
+fn anchored(frame: NSRect, anchor: NSPoint) -> NSPoint {
+    NSPoint {
+        x: frame.origin.x + anchor.x * frame.size.width,
+        y: frame.origin.y + anchor.y * frame.size.height,
+    }
+}
+
+/// Move `layer` so its frame starts where `frame` does, for a layer whose
+/// bounds already have `frame`'s size: the half of `-setFrame:` that is not
+/// the bounds.
+pub(crate) fn set_position_for_frame(layer: Id, frame: NSRect) {
+    let moved = with_node(layer, |node| {
+        let position = anchored(frame, node.anchor);
+        std::mem::replace(&mut node.position, position) != position
+    });
+    if moved {
+        changed_metadata(layer);
+    }
 }
 
 unsafe extern "C" fn position(receiver: Id, _sel: Sel) -> NSPoint {
@@ -830,6 +860,22 @@ unsafe extern "C" fn corner_radius(receiver: Id, _sel: Sel) -> f64 {
 unsafe extern "C" fn set_corner_radius(receiver: Id, _sel: Sel, value: f64) {
     with_node(receiver, |node| node.corner_radius = value.max(0.0));
     changed_metadata(receiver);
+}
+
+unsafe extern "C" fn z_position(receiver: Id, _sel: Sel) -> f64 {
+    read_node(receiver, |node| node.map_or(0.0, |node| node.z_position))
+}
+
+unsafe extern "C" fn set_z_position(receiver: Id, _sel: Sel, value: f64) {
+    let superlayer = with_node(receiver, |node| {
+        node.z_position = value;
+        node.superlayer
+    });
+    changed_metadata(receiver);
+    // The order is the superlayer's to draw.
+    if superlayer != 0 {
+        changed_metadata(superlayer as Id);
+    }
 }
 
 unsafe extern "C" fn is_hidden(receiver: Id, _sel: Sel) -> u8 {
@@ -2074,9 +2120,9 @@ impl Presented {
 
 fn presentation(layer: Id, now: f64) -> Presented {
     let bounds = crate::layer::bounds_of(layer);
-    read_node(layer, |node| {
+    read_all_nodes(|nodes| {
         let fallback = Node::default();
-        let node = node.unwrap_or(&fallback);
+        let node = nodes.get(&(layer as usize)).unwrap_or(&fallback);
         let animations = &node.animations;
         let width = presented(animations, "bounds.size.width", bounds.size.width, now);
         let height = presented(animations, "bounds.size.height", bounds.size.height, now);
@@ -2097,7 +2143,7 @@ fn presentation(layer: Id, now: f64) -> Presented {
             masks_to_bounds: node.masks_to_bounds,
             corner_radius: node.corner_radius,
             gravity: node.gravity,
-            sublayers: node.sublayers.clone(),
+            sublayers: drawing_order(nodes, &node.sublayers),
         }
     })
 }
@@ -2458,6 +2504,29 @@ fn place(gravity: Gravity, bounds: Rect, width: f64, height: f64) -> (f64, f64, 
         _ => by + (bh - height) / 2.0,
     };
     (x, y, width, height)
+}
+
+/// The window pixels contents of `width` by `height` pixels cover when
+/// `layer`'s bounds fill `bounds`, `scale` window pixels to the point: the
+/// bounds themselves under the default `resize` gravity, and otherwise the
+/// contents at their own size, `contentsScale` pixels to the point, placed
+/// as the gravity says. `None` for contents with no area.
+pub(crate) fn contents_rect(
+    layer: Id,
+    bounds: Rect,
+    scale: (f64, f64),
+    (width, height): (u32, u32),
+) -> Option<Rect> {
+    let gravity = read_node(layer, |node| {
+        node.map_or(Gravity::Resize, |node| node.gravity)
+    });
+    let contents_scale = crate::layer::contents_scale_of(layer);
+    source_area(place(
+        gravity,
+        bounds,
+        f64::from(width) / contents_scale * scale.0,
+        f64::from(height) / contents_scale * scale.1,
+    ))
 }
 
 /// Use the same gravity and pixel-edge rounding as draw_contents, without
@@ -3204,7 +3273,7 @@ pub(crate) fn metal_paint_steps(root: Id, view_layers: &[usize], now: f64) -> Ve
                     }),
                 }
             }
-            for &child in &node.sublayers {
+            for child in drawing_order(nodes, &node.sublayers) {
                 walk(nodes, child, view_layers, now, groups, depth + 1, out);
             }
             if isolate {
@@ -3214,7 +3283,7 @@ pub(crate) fn metal_paint_steps(root: Id, view_layers: &[usize], now: f64) -> Ve
         let mut steps = Vec::new();
         if let Some(root) = nodes.get(&(root as usize)) {
             let mut groups = Vec::new();
-            for &child in &root.sublayers {
+            for child in drawing_order(nodes, &root.sublayers) {
                 walk(nodes, child, view_layers, now, &mut groups, 0, &mut steps);
             }
         }
@@ -3434,6 +3503,8 @@ pub(crate) fn install() {
         "setMasksToBounds:" => set_masks_to_bounds, c"v20@0:8c16";
         "cornerRadius" => corner_radius, c"d16@0:8";
         "setCornerRadius:" => set_corner_radius, c"v24@0:8d16";
+        "zPosition" => z_position, c"d16@0:8";
+        "setZPosition:" => set_z_position, c"v24@0:8d16";
         "isHidden" => is_hidden, c"c16@0:8";
         "setHidden:" => set_hidden, c"v20@0:8c16";
         "opacity" => opacity, c"f16@0:8";
@@ -5956,6 +6027,74 @@ mod tests {
         }
         assert_eq!(objc::arc::retain_count(object), before - 1);
         objc::arc::release(object);
+        objc::arc::pool_pop(pool);
+    }
+
+    /// AppKit keeps a view's backing layer on the view's frame, so a program
+    /// that sizes what it draws by `-[CALayer frame]` sees every resize.
+    #[test]
+    fn a_backing_layer_frame_follows_its_view() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let view: Id = send(view, "initWithFrame:", rect(0., 0., 100., 100.));
+        send::<u8, ()>(view, "setWantsLayer:", 1);
+        let layer: Id = send(view, "layer", ());
+        // SAFETY: `-frame` of a layer this test made.
+        let frame_of = |layer| unsafe { frame(layer, objc::sel::get("frame")) };
+        assert_eq!(frame_of(layer), rect(0., 0., 100., 100.));
+        let size = NSSize {
+            width: 1200.,
+            height: 750.,
+        };
+        send::<NSSize, ()>(view, "setFrameSize:", size);
+        assert_eq!(frame_of(layer), rect(0., 0., 1200., 750.));
+        send::<NSRect, ()>(view, "setFrame:", rect(10., 20., 30., 40.));
+        assert_eq!(frame_of(layer), rect(10., 20., 30., 40.));
+        objc::arc::release(view);
+        objc::arc::pool_pop(pool);
+    }
+
+    /// A drawable larger than its layer, as a program that rounds its drawable
+    /// size up allocates, shows at its own size from where the gravity puts
+    /// it; under the default gravity it is scaled to the bounds.
+    #[test]
+    fn oversized_contents_land_where_the_gravity_puts_them() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let class = objc::class::ptr(objc::class::lookup(c"CAMetalLayer").unwrap()) as Id;
+        let layer: Id = send(class, "layer", ());
+        let bounds = Rect {
+            x: 0,
+            y: 28,
+            width: 1200,
+            height: 750,
+        };
+        let drawable = (1280, 768);
+        assert_eq!(
+            contents_rect(layer, bounds, (1., 1.), drawable),
+            Some(bounds)
+        );
+        set_gravity(layer, Gravity::TopLeft);
+        let natural = Rect {
+            width: 1280,
+            height: 768,
+            ..bounds
+        };
+        assert_eq!(
+            contents_rect(layer, bounds, (1., 1.), drawable),
+            Some(natural)
+        );
+        send::<f64, ()>(layer, "setContentsScale:", 2.);
+        let halved = Rect {
+            width: 640,
+            height: 384,
+            ..bounds
+        };
+        assert_eq!(
+            contents_rect(layer, bounds, (1., 1.), drawable),
+            Some(halved)
+        );
         objc::arc::pool_pop(pool);
     }
 }

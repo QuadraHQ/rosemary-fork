@@ -3,6 +3,8 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
+#[cfg(target_os = "macos")]
+mod cocoa;
 pub mod compositor;
 pub mod desktop;
 #[cfg(any(test, feature = "test-support"))]
@@ -12,7 +14,7 @@ pub mod mouse;
 pub mod pointer;
 pub mod tray;
 pub mod wayland;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub mod wayland_mask;
 pub mod x11_mask;
 
@@ -937,18 +939,48 @@ macro_rules! getter {
     };
 }
 
-getter!(/// The USB vendor id, or zero for a device that reports none.
-    vendor, SDL_GetJoystickVendor, u16, 0);
-getter!(/// The USB product id.
-    product, SDL_GetJoystickProduct, u16, 0);
-getter!(/// The device's version, which is the third word of a HID GUID.
-    version, SDL_GetJoystickProductVersion, u16, 0);
-getter!(/// How many axes it has.
-    axes, SDL_GetNumJoystickAxes, c_int, 0);
-getter!(/// How many buttons it has.
-    buttons, SDL_GetNumJoystickButtons, c_int, 0);
-getter!(/// How many hats it has.
-    hats, SDL_GetNumJoystickHats, c_int, 0);
+getter!(
+    /// The USB vendor id, or zero for a device that reports none.
+    vendor,
+    SDL_GetJoystickVendor,
+    u16,
+    0
+);
+getter!(
+    /// The USB product id.
+    product,
+    SDL_GetJoystickProduct,
+    u16,
+    0
+);
+getter!(
+    /// The device's version, which is the third word of a HID GUID.
+    version,
+    SDL_GetJoystickProductVersion,
+    u16,
+    0
+);
+getter!(
+    /// How many axes it has.
+    axes,
+    SDL_GetNumJoystickAxes,
+    c_int,
+    0
+);
+getter!(
+    /// How many buttons it has.
+    buttons,
+    SDL_GetNumJoystickButtons,
+    c_int,
+    0
+);
+getter!(
+    /// How many hats it has.
+    hats,
+    SDL_GetNumJoystickHats,
+    c_int,
+    0
+);
 
 /// One axis, in SDL's own `-32768..32767`.
 ///
@@ -2497,7 +2529,9 @@ pub mod video {
     pub fn init_video() -> bool {
         let mut up = VIDEO_UP.lock().unwrap_or_else(|e| e.into_inner());
         if !*up {
-            if cfg!(target_os = "linux") && get_hint(c"SDL_VIDEO_DRIVER").is_none() {
+            if cfg!(any(target_os = "linux", target_os = "freebsd"))
+                && get_hint(c"SDL_VIDEO_DRIVER").is_none()
+            {
                 // Hack for an SDL bug where SDL mistakenly classifies Niri as incapable of being
                 // a Wayland compositor, yet somehow capable of being an Xwayland one.
                 // Unsure if this is a Niri or SDL bug to be honest, it literally ONLY happens on Niri.
@@ -5504,6 +5538,39 @@ pub mod video {
             )
         };
         (!display.is_null() && !surface.is_null()).then_some((display, surface))
+    }
+
+    /// A window's `NSWindow`, on macOS.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn cocoa_window(window: Window) -> Option<*mut c_void> {
+        // The window behind a window on the desktop is never shown.
+        if crate::desktop::owns(window) {
+            return None;
+        }
+        let api = api()?;
+        let (props, get) = (api.SDL_GetWindowProperties?, api.SDL_GetPointerProperty?);
+        // SAFETY: a window from SDL, and a property name SDL documents.
+        let ns_window = unsafe {
+            get(
+                props(window),
+                c"SDL.window.cocoa.window".as_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        (!ns_window.is_null()).then_some(ns_window)
+    }
+
+    /// Have the host's window server round `window`'s corners to `radius`
+    /// points, or square them for 0, without its pixels needing alpha. False
+    /// where the host cannot.
+    pub fn round_corners(window: Window, radius: f64) -> bool {
+        #[cfg(target_os = "macos")]
+        return crate::cocoa::round_corners(window, radius);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (window, radius);
+            false
+        }
     }
 
     /// `SDL_SystemTheme`.

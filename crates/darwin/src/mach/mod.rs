@@ -7,6 +7,7 @@ pub mod info;
 pub mod kern;
 pub mod local;
 pub mod msg;
+mod ool;
 pub mod remote;
 pub mod senders;
 pub mod service;
@@ -143,6 +144,7 @@ exports::exports! {
         "thread_suspend" => thread::thread_suspend,
         "thread_resume" => thread::thread_resume,
         "thread_get_state" => thread::thread_get_state,
+        "thread_get_register_pointer_values" => thread::thread_get_register_pointer_values,
         "thread_set_state" => thread::thread_set_state,
         "thread_abort" | "thread_abort_safely" => thread::thread_abort,
         "thread_policy_set" => thread::thread_policy_set,

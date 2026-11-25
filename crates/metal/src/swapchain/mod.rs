@@ -5644,6 +5644,7 @@ impl Swapchain {
                             }
                         }
                     }
+                    let accumulated = self.composite.as_ref().expect("made above");
                     let shown = match &self.corners {
                         Some(corners) => {
                             let shape = self.composite_shape.unwrap_or_else(|| {
@@ -5653,8 +5654,10 @@ impl Swapchain {
                                     self.extent.height,
                                 )
                             });
-                            let image = self.composite.as_ref().expect("made above");
-                            corners.record(command_buffer, slot, image, shape)
+                            (
+                                corners.record(command_buffer, slot, accumulated, shape),
+                                corners::FORMAT,
+                            )
                         }
                         None => {
                             // The blit above must land before the one below
@@ -5668,16 +5671,16 @@ impl Swapchain {
                                 vk::AccessFlags::TRANSFER_WRITE,
                                 vk::AccessFlags::TRANSFER_READ,
                             );
-                            composite
+                            (composite, accumulated.format)
                         }
                     };
                     if let Some(clipped) = logical {
-                        blit(
+                        copy_or_blit(
                             device,
                             command_buffer,
                             shown,
                             clipped,
-                            target,
+                            (target, self.format),
                             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                             clipped,
                         );
@@ -5690,12 +5693,12 @@ impl Swapchain {
                         appkit::window::presentation_clip(frame.window),
                         (source.width, source.height),
                     ) {
-                        blit(
+                        copy_or_blit(
                             device,
                             command_buffer,
-                            source.image,
+                            (source.image, source.format),
                             from,
-                            target,
+                            (target, self.format),
                             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                             into,
                         );

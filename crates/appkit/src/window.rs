@@ -56,9 +56,9 @@ pub struct Window {
     /// Guest confinement is measured in AppKit coordinates, not SDL coordinates.
     mouse_confinement: NSRect,
     miniaturized: usize,
-    /// `-representedFilename`, an owned `NSString` or null for the empty
-    /// string AppKit answers before one is set.
-    represented_filename: Id,
+    /// `-representedURL`, an owned `NSURL` or null. `-representedFilename` is
+    /// its path, as AppKit keeps the two as one property.
+    represented_url: Id,
     /// `NSPanel`'s `-becomesKeyOnlyIfNeeded`. A panel's field, kept in the
     /// window body because `NSPanel` adds no storage of its own here - every
     /// panel *is* one of these - and one word costs less than a side table
@@ -160,6 +160,8 @@ mod style {
 /// A Wayland compositor does not - a menu has to be a popup surface, positioned
 /// against its parent - so the level is what this tree classifies by.
 mod window_level {
+    /// `NSNormalWindowLevel`: an ordinary document window.
+    pub const NORMAL: isize = 0;
     /// `NSFloatingWindowLevel`: a tool palette, above its document.
     pub const FLOATING: isize = 3;
     /// `NSPopUpMenuWindowLevel`: a menu, a combo box's list, a popover.
@@ -222,6 +224,11 @@ fn presentation(window: &Window) -> Presentation {
     match window.level {
         level if level >= window_level::SCREEN_SAVER => Presentation::Tooltip,
         level if level >= window_level::POPUP_MENU => Presentation::Menu,
+        // A transient floating window, such as a drag indicator, is placed by
+        // the program; the host tiles and focuses a toplevel as it likes.
+        level if level > window_level::NORMAL && window.hides_on_deactivate != 0 => {
+            Presentation::Menu
+        }
         _ => Presentation::Toplevel,
     }
 }
@@ -627,9 +634,9 @@ fn destroy_sdl_window(sdl: sdl3::Window) {
     for member in family.into_iter().rev() {
         // Remove fullscreen native overlays before retiring each member,
         // including SDL popups which SDL otherwise destroys recursively.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         sdl3::x11_mask::forget(member);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         sdl3::wayland_mask::forget(member);
         // A separately retired child has already received its own cleanup.
         if sdl3::video::live_window_id(member).is_none() {
@@ -1267,7 +1274,7 @@ pub(crate) fn refresh_idle_opengl_clip(sdl: sdl3::Window) {
     if sdl.is_null() || !draws_with_opengl(sdl) {
         return;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         if !sdl3::video::is_x11() && !sdl3::video::is_wayland() {
             return;
@@ -2310,27 +2317,40 @@ unsafe extern "C" fn title(receiver: Id, _sel: Sel) -> Id {
     objc::arc::autorelease(foundation::string::from_cstr(&title))
 }
 
-/// `-setRepresentedFilename:`. AppKit shows the file's proxy icon in the title
-/// bar; SDL has no such thing, so the path is only kept to be read back.
-unsafe extern "C" fn set_represented_filename(receiver: Id, _sel: Sel, filename: Id) {
+/// `-setRepresentedURL:`. AppKit shows the file's proxy icon in the title bar;
+/// SDL has no such thing, so the URL is only kept to be read back.
+unsafe extern "C" fn set_represented_url(receiver: Id, _sel: Sel, url: Id) {
     let window = window_of(receiver);
-    let copy = match filename.is_null() {
+    let old = std::mem::replace(&mut window.represented_url, objc::arc::retain(url));
+    objc::arc::release(old);
+}
+
+unsafe extern "C" fn represented_url(receiver: Id, _sel: Sel) -> Id {
+    window_of(receiver).represented_url
+}
+
+/// `-setRepresentedFilename:`: a file URL for the path, or none for the empty
+/// string.
+unsafe extern "C" fn set_represented_filename(receiver: Id, sel: Sel, filename: Id) {
+    // SAFETY: an `NSString`, or nil.
+    let bytes = unsafe { foundation::string::bytes(filename) };
+    let path = String::from_utf8_lossy(&bytes);
+    let url = match path.is_empty() {
         true => std::ptr::null_mut(),
-        false => {
-            // SAFETY: an `NSString`; copied, as the property is declared `copy`.
-            let bytes = unsafe { foundation::string::bytes(filename) };
-            foundation::string::from_str(&String::from_utf8_lossy(&bytes))
-        }
+        false => corefoundation::url::new_file_url(&path, path.ends_with('/')) as Id,
     };
-    objc::arc::release(window.represented_filename);
-    window.represented_filename = copy;
+    // SAFETY: this window, and a URL this function owns.
+    unsafe { set_represented_url(receiver, sel, url) };
+    objc::arc::release(url);
 }
 
 unsafe extern "C" fn represented_filename(receiver: Id, _sel: Sel) -> Id {
-    match window_of(receiver).represented_filename {
-        filename if filename.is_null() => objc::arc::autorelease(foundation::string::from_str("")),
-        filename => filename,
-    }
+    let url = window_of(receiver).represented_url;
+    // SAFETY: null or an `NSURL` this runtime allocated.
+    let path = unsafe { corefoundation::url::as_url(url as corefoundation::base::CFTypeRef) }
+        .and_then(|url| url.file_path())
+        .unwrap_or_default();
+    objc::arc::autorelease(foundation::string::from_str(&path))
 }
 
 /// `-setTitleWithRepresentedFilename:`: the represented filename, and the
@@ -2565,7 +2585,7 @@ pub(crate) unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
         std::ptr::null_mut(),
     ));
     objc::arc::release(std::mem::replace(
-        &mut window.represented_filename,
+        &mut window.represented_url,
         std::ptr::null_mut(),
     ));
     let frame_view = std::mem::replace(&mut window.frame_view, std::ptr::null_mut());
@@ -2882,6 +2902,17 @@ unsafe extern "C" fn screen(receiver: Id, _sel: Sel) -> Id {
         f(class, objc::sel::get("mainScreen"))
     }
 }
+
+/// `NSBackingStoreBuffered`.
+const BACKING_STORE_BUFFERED: usize = 2;
+
+/// `-backingType`. AppKit treats the deprecated retained and nonretained
+/// stores as buffered, which is the one kind every window here has.
+unsafe extern "C" fn backing_type(_receiver: Id, _sel: Sel) -> usize {
+    BACKING_STORE_BUFFERED
+}
+
+unsafe extern "C" fn set_backing_type(_receiver: Id, _sel: Sel, _backing: usize) {}
 
 /// `-userSpaceScaleFactor`: the backing factor, as `NSScreen`'s answers, so a
 /// window and its screen agree.
@@ -4048,6 +4079,8 @@ pub(crate) fn install() {
         "setStyleMask:" => set_style_mask, c"v24@0:8Q16";
         "setReleasedWhenClosed:" => ignored_flag, c"v20@0:8c16";
         "isOpaque" => yes, c"c16@0:8";
+        "backingType" => backing_type, c"Q16@0:8";
+        "setBackingType:" => set_backing_type, c"v24@0:8Q16";
         "setOpaque:" => ignored_flag, c"v20@0:8c16";
         "setHidesOnDeactivate:" => set_hides_on_deactivate, c"v20@0:8c16";
         "hidesOnDeactivate" => hides_on_deactivate, c"c16@0:8";
@@ -4099,6 +4132,8 @@ pub(crate) fn install() {
         "setTitleWithRepresentedFilename:" => set_title_with_represented_filename, c"v24@0:8@16";
         "representedFilename" => represented_filename, c"@16@0:8";
         "setRepresentedFilename:" => set_represented_filename, c"v24@0:8@16";
+        "representedURL" => represented_url, c"@16@0:8";
+        "setRepresentedURL:" => set_represented_url, c"v24@0:8@16";
         "ignoresMouseEvents" => no, c"c16@0:8";
         "toolbar" => nil, c"@16@0:8";
         "depthLimit" => zero_depth, c"i16@0:8";
@@ -4209,6 +4244,16 @@ mod tests {
         body.style_mask = 0;
         body.level = 0;
         assert_eq!(presentation(body), Presentation::Toplevel);
+
+        // Borderless above the ordinary level is a popup when it hides on
+        // deactivation, and a toplevel otherwise.
+        body.level = window_level::FLOATING;
+        assert_eq!(presentation(body), Presentation::Toplevel);
+        body.hides_on_deactivate = 1;
+        assert_eq!(presentation(body), Presentation::Menu);
+        body.level = window_level::NORMAL;
+        assert_eq!(presentation(body), Presentation::Toplevel);
+        body.hides_on_deactivate = 0;
 
         // Borderless at menu level and above are the two popups.
         body.level = window_level::POPUP_MENU;

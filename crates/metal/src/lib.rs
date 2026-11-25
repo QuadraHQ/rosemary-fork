@@ -180,6 +180,16 @@ pub(crate) fn gpu_of_device(device: Id) -> Option<&'static Gpu> {
     object::is_kind(device, c"RosemaryMTLDevice").then(|| gpu_of(device))?
 }
 
+/// The `MTLDevice` that owns `gpu`, which is what a resource made on it answers
+/// to `-device`. Devices are immortal, so the answer is at +0 for good.
+pub(crate) fn device_of_gpu(gpu: &'static Gpu) -> Id {
+    exports::devices()
+        .iter()
+        .map(|&device| device as Id)
+        .find(|&device| gpu_of_device(device).is_some_and(|owner| std::ptr::eq(owner, gpu)))
+        .unwrap_or(std::ptr::null_mut())
+}
+
 pub fn bootstrap() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -243,6 +253,8 @@ pub fn bootstrap() {
             "newDepthStencilStateWithDescriptor:" => new_depth_stencil_state, c"@24@0:8@16";
             "newDefaultLibrary" => new_default_library, c"@16@0:8";
             "newLibraryWithData:error:" => new_library_with_data, c"@32@0:8@16^@24";
+            "newLibraryWithFile:error:" => new_library_with_file, c"@32@0:8@16^@24";
+            "newLibraryWithURL:error:" => new_library_with_url, c"@32@0:8@16^@24";
             "newLibraryWithSource:options:error:" => new_library_with_source, c"@40@0:8@16@24^@32";
             "newLibraryWithSource:options:completionHandler:" => compile::new_library_with_source,
                 c"v40@0:8@16@24@?32";

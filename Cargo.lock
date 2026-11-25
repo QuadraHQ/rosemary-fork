@@ -658,6 +658,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "coremidi"
+version = "0.5.0"
+dependencies = [
+ "corefoundation",
+ "darwin",
+ "exports",
+]
+
+[[package]]
 name = "coreservices"
 version = "0.5.0-quadra.4"
 dependencies = [
@@ -1958,9 +1967,9 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "llvm-bitcode"
-version = "0.4.0"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0b22996bbeff44d0b756679007f43a728d393ab9f6de5109c125fcf89f23e3c"
+checksum = "e81c545b8986967f5d96021ee724fc6a00630b177a22930c3843f2aac0fd19f8"
 dependencies = [
  "bitflags 2.13.1",
  "num_enum",
@@ -2052,6 +2061,7 @@ dependencies = [
  "libc",
  "metal_translate",
  "objc",
+ "prefix",
  "rspirv",
  "sdl3",
  "sha2 0.11.0",
@@ -2074,7 +2084,7 @@ dependencies = [
 [[package]]
 name = "microlift"
 version = "0.1.0"
-source = "git+https://github.com/microlift/microlift?rev=ef03e1f07f8c103f4bc3a59057d0a63c2efe8133#ef03e1f07f8c103f4bc3a59057d0a63c2efe8133"
+source = "git+https://github.com/microlift/microlift?rev=c74fa6582903514b45d50886611b9a89eb4f49e7#c74fa6582903514b45d50886611b9a89eb4f49e7"
 dependencies = [
  "capstone",
  "cranelift",
@@ -2667,6 +2677,7 @@ dependencies = [
  "coreaudio",
  "corefoundation",
  "coremedia",
+ "coremidi",
  "coreservices",
  "coretext",
  "corevideo",
