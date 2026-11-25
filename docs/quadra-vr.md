@@ -167,6 +167,12 @@ pacing report every 900 frames.
 
 ## What has been checked
 
+### 0.5.0-quadra.5 (web view bridge)
+
+Upstream Rosemary merged up to `c8f2cb41`. `ROSEMARY_WEBKIT_BRIDGE` lets
+another process show `WKWebView`s (see `docs/usage.md`); Quadra 0.52.0 uses it
+for its separate web page window.
+
 ### 0.5.0-quadra.4 (video memory query)
 
 `CGLDescribeRenderer` now always answers the video memory properties, so a GPU

@@ -1410,6 +1410,16 @@ unsafe extern "C" fn listener_download(receiver: Id, _sel: Sel) {
 /// in this runtime's legacy web view, so there is nothing to record.
 unsafe extern "C" fn register_scheme_as_local(_class: Id, _sel: Sel, _scheme: Id) {}
 
+/// Whether `object` is a WebKit1 `WebView`.
+pub fn is_web_view(object: Id) -> bool {
+    // SAFETY: null or an object this runtime allocated.
+    let class = unsafe { objc::object::class_of(object) };
+    let web_view = objc::class::lookup(c"WebView");
+    class
+        .zip(web_view)
+        .is_some_and(|(class, web_view)| class.chain().any(|c| std::ptr::eq(c, web_view)))
+}
+
 pub fn install() {
     let wk = objc::class::lookup(c"WKWebView").expect("installed before this");
     let web_view = corefoundation::base::abstract_class(c"WebView", Some(wk));

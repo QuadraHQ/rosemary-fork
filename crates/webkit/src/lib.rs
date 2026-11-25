@@ -2,6 +2,7 @@ use objc::class::Class;
 use objc::object::Id;
 use objc::sel::Sel;
 
+mod bridge;
 mod clipboard;
 mod compositor;
 mod configuration;

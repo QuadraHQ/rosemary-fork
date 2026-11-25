@@ -217,6 +217,14 @@ pub fn defer(work: impl FnOnce() + 'static) {
     DEFERRED.with(|deferred| deferred.borrow_mut().push(Box::new(work)));
 }
 
+/// Run what [`defer`] has queued.
+pub fn run_deferred() {
+    let work = DEFERRED.with(|deferred| std::mem::take(&mut *deferred.borrow_mut()));
+    for item in work {
+        item();
+    }
+}
+
 fn pump() {
     let Some(engine) = running() else {
         return;
@@ -230,10 +238,7 @@ fn pump() {
             break;
         }
     }
-    let work = DEFERRED.with(|deferred| std::mem::take(&mut *deferred.borrow_mut()));
-    for item in work {
-        item();
-    }
+    run_deferred();
     crate::web_view::tick(engine);
     restore_guest_gl(engine.api);
     objc::arc::pool_pop(pool);

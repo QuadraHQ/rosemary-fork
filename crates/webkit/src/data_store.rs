@@ -3,7 +3,9 @@ use std::ffi::c_int;
 use corefoundation::base::CFTypeRef;
 use objc::object::Id;
 use objc::sel::Sel;
+use serde_json::{Value, json};
 
+use crate::bridge::{self, Pending};
 use crate::engine::{self, Block, Engine};
 use crate::gtk::{self, GList, Ptr};
 use crate::send;
@@ -92,36 +94,29 @@ fn cookie_manager(engine: &Engine) -> Ptr {
     unsafe { (engine.api.webkit_network_session_get_cookie_manager)(engine.session as Ptr) }
 }
 
-/// The `NSHTTPCookie` for a libsoup cookie.
-///
-/// # Safety
-///
-/// `cookie` must be a live `SoupCookie`.
-unsafe fn cookie_object(api: &gtk::Api, cookie: Ptr) -> Id {
-    // SAFETY: the caller's obligation; each getter returns a string the cookie owns.
-    let (name, value, domain, path, secure, expires) = unsafe {
-        (
-            gtk::text((api.soup_cookie_get_name)(cookie)),
-            gtk::text((api.soup_cookie_get_value)(cookie)),
-            gtk::text((api.soup_cookie_get_domain)(cookie)),
-            gtk::text((api.soup_cookie_get_path)(cookie)),
-            (api.soup_cookie_get_secure)(cookie) != 0,
-            (api.soup_cookie_get_expires)(cookie),
-        )
-    };
+/// What a cookie store holds, however it is reached.
+struct Cookie {
+    name: String,
+    value: String,
+    domain: String,
+    path: String,
+    secure: bool,
+    /// Seconds since 1970; `None` for a session cookie.
+    expires: Option<i64>,
+}
+
+fn ns_cookie(cookie: &Cookie) -> Id {
     let mut pairs: Vec<(Id, Id)> = [
-        ("NSHTTPCookieName", name.as_str()),
-        ("NSHTTPCookieValue", value.as_str()),
-        ("NSHTTPCookieDomain", domain.as_str()),
-        ("NSHTTPCookiePath", path.as_str()),
+        ("NSHTTPCookieName", cookie.name.as_str()),
+        ("NSHTTPCookieValue", cookie.value.as_str()),
+        ("NSHTTPCookieDomain", cookie.domain.as_str()),
+        ("NSHTTPCookiePath", cookie.path.as_str()),
     ]
     .into_iter()
-    .chain(secure.then_some(("NSHTTPCookieSecure", "TRUE")))
+    .chain(cookie.secure.then_some(("NSHTTPCookieSecure", "TRUE")))
     .map(|(key, value)| (engine::string(key), engine::string(value)))
     .collect();
-    if !expires.is_null() {
-        // SAFETY: a `GDateTime` the cookie owns.
-        let seconds = unsafe { (api.g_date_time_to_unix)(expires) };
+    if let Some(seconds) = cookie.expires {
         pairs.push((
             engine::string("NSHTTPCookieExpires"),
             foundation::timer::date_since_1970(seconds as f64),
@@ -146,7 +141,7 @@ unsafe fn cookie_object(api: &gtk::Api, cookie: Ptr) -> Id {
     cookie
 }
 
-/// A libsoup cookie for an `NSHTTPCookie`, owned by the caller.
+/// What an `NSHTTPCookie` holds.
 ///
 /// Foundation keeps a cookie's domain without its leading dot, which to
 /// libsoup is a host-only cookie. The dot is put back, so a cookie Studio
@@ -156,7 +151,7 @@ unsafe fn cookie_object(api: &gtk::Api, cookie: Ptr) -> Id {
 /// # Safety
 ///
 /// `cookie` must be an `NSHTTPCookie`.
-unsafe fn soup_cookie(api: &gtk::Api, cookie: Id) -> Ptr {
+unsafe fn read_cookie(cookie: Id) -> Cookie {
     // SAFETY: the caller's obligation; each accessor is `id (id, SEL)`.
     let (name, value, domain, path, secure, expires) = unsafe {
         (
@@ -177,11 +172,97 @@ unsafe fn soup_cookie(api: &gtk::Api, cookie: Id) -> Ptr {
         true => "/".to_string(),
         false => path,
     };
+    let expires = (!expires.is_null())
+        // SAFETY: an `NSDate`; `-timeIntervalSince1970` is `double (id, SEL)`.
+        .then(|| unsafe { send!(expires, "timeIntervalSince1970"; f64) } as i64);
+    Cookie {
+        name,
+        value,
+        domain,
+        path,
+        secure,
+        expires,
+    }
+}
+
+fn cookie_array(objects: &[CFTypeRef]) -> Id {
+    let array = corefoundation::collections::new_array(
+        objects,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    objc::arc::autorelease(array as Id)
+}
+
+/// The bridge's reply to `cookies-get`.
+pub(crate) fn cookies_reply(completion: &Block, reply: &Value) {
+    if let Some(error) = reply["error"].as_str() {
+        engine::warn_once(&format!("reading cookies failed: {error}"));
+    }
+    let objects: Vec<CFTypeRef> = reply["value"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|cookie| {
+            let field = |key: &str| cookie[key].as_str().unwrap_or_default().to_string();
+            ns_cookie(&Cookie {
+                name: field("name"),
+                value: field("value"),
+                domain: field("domain"),
+                path: field("path"),
+                secure: cookie["secure"].as_bool().unwrap_or_default(),
+                expires: cookie["expires"].as_i64(),
+            })
+        })
+        .filter(|object| !object.is_null())
+        .map(|object| object as CFTypeRef)
+        .collect();
+    completion.call1(cookie_array(&objects));
+}
+
+/// The `NSHTTPCookie` for a libsoup cookie.
+///
+/// # Safety
+///
+/// `cookie` must be a live `SoupCookie`.
+unsafe fn cookie_object(api: &gtk::Api, cookie: Ptr) -> Id {
+    // SAFETY: the caller's obligation; each getter returns a string the cookie owns.
+    let (name, value, domain, path, secure, expires) = unsafe {
+        (
+            gtk::text((api.soup_cookie_get_name)(cookie)),
+            gtk::text((api.soup_cookie_get_value)(cookie)),
+            gtk::text((api.soup_cookie_get_domain)(cookie)),
+            gtk::text((api.soup_cookie_get_path)(cookie)),
+            (api.soup_cookie_get_secure)(cookie) != 0,
+            (api.soup_cookie_get_expires)(cookie),
+        )
+    };
+    let expires = (!expires.is_null())
+        // SAFETY: a `GDateTime` the cookie owns.
+        .then(|| unsafe { (api.g_date_time_to_unix)(expires) });
+    ns_cookie(&Cookie {
+        name,
+        value,
+        domain,
+        path,
+        secure,
+        expires,
+    })
+}
+
+/// A libsoup cookie for an `NSHTTPCookie`, owned by the caller.
+///
+/// # Safety
+///
+/// `cookie` must be an `NSHTTPCookie`.
+unsafe fn soup_cookie(api: &gtk::Api, cookie: Id) -> Ptr {
+    // SAFETY: the caller's obligation.
+    let cookie = unsafe { read_cookie(cookie) };
     let (name, value, domain, path) = (
-        gtk::c_string(&name),
-        gtk::c_string(&value),
-        gtk::c_string(&domain),
-        gtk::c_string(&path),
+        gtk::c_string(&cookie.name),
+        gtk::c_string(&cookie.value),
+        gtk::c_string(&cookie.domain),
+        gtk::c_string(&cookie.path),
     );
     // SAFETY: four NUL-terminated strings, which the cookie copies; -1 is a
     // session cookie until an expiry is set below.
@@ -194,12 +275,11 @@ unsafe fn soup_cookie(api: &gtk::Api, cookie: Id) -> Ptr {
             -1,
         )
     };
-    // SAFETY: a fresh cookie; `-timeIntervalSince1970` is `double (id, SEL)`.
+    // SAFETY: a fresh cookie.
     unsafe {
-        (api.soup_cookie_set_secure)(soup, c_int::from(secure));
-        if !expires.is_null() {
-            let seconds = send!(expires, "timeIntervalSince1970"; f64);
-            let date = (api.g_date_time_new_from_unix_utc)(seconds as i64);
+        (api.soup_cookie_set_secure)(soup, c_int::from(cookie.secure));
+        if let Some(seconds) = cookie.expires {
+            let date = (api.g_date_time_new_from_unix_utc)(seconds);
             if !date.is_null() {
                 (api.soup_cookie_set_expires)(soup, date);
                 (api.g_date_time_unref)(date);
@@ -259,6 +339,10 @@ unsafe extern "C" fn get_all_cookies(_receiver: Id, _sel: Sel, completion: Id) {
     let Some(completion) = Block::copy(completion) else {
         return;
     };
+    if let Some(bridge) = bridge::get() {
+        bridge.request(json!({ "op": "cookies-get" }), Pending::Cookies(completion));
+        return;
+    }
     let Some(engine) = engine::get() else {
         engine::defer(move || completion.call1(empty_array()));
         return;
@@ -310,6 +394,26 @@ unsafe extern "C" fn change_ready(source: Ptr, result: Ptr, data: Ptr) {
 
 fn change_cookie(cookie: Id, completion: Id, adding: bool) {
     let completion = Block::copy(completion);
+    if let Some(bridge) = bridge::get().filter(|_| !cookie.is_null()) {
+        // SAFETY: an `NSHTTPCookie`, checked non-nil above.
+        let cookie = unsafe { read_cookie(cookie) };
+        let message = json!({
+            "op": if adding { "cookie-set" } else { "cookie-delete" },
+            "cookie": {
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain,
+                "path": cookie.path,
+                "secure": cookie.secure,
+                "expires": cookie.expires,
+            },
+        });
+        match completion {
+            Some(completion) => bridge.request(message, Pending::CookieChange(completion)),
+            None => bridge.send(message),
+        }
+        return;
+    }
     let Some(engine) = engine::get().filter(|_| !cookie.is_null()) else {
         if let Some(completion) = completion {
             engine::defer(move || completion.call0());
