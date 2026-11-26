@@ -83,6 +83,7 @@ exports::exports! {
         "CFCopyTypeIDDescription" => api::CFCopyTypeIDDescription,
         "CFStringCompareWithOptions" => api::CFStringCompareWithOptions,
         "CFStringFindWithOptions" => api::CFStringFindWithOptions,
+        "CFStringFindWithOptionsAndLocale" => api::CFStringFindWithOptionsAndLocale,
         "CFStringCreateMutable" => api::CFStringCreateMutable,
         "CFStringCreateMutableCopy" => api::CFStringCreateMutableCopy,
         "CFStringUppercase" => api::CFStringUppercase,
@@ -92,6 +93,8 @@ exports::exports! {
         "CFStringGetCharacterAtIndex" => api::CFStringGetCharacterAtIndex,
         "CFStringGetCharacters" => api::CFStringGetCharacters,
         "CFStringGetCharactersPtr" => api::CFStringGetCharactersPtr,
+        "CFStringGetRangeOfComposedCharactersAtIndex"
+            => api::CFStringGetRangeOfComposedCharactersAtIndex,
         "CFStringAppendCharacters" => api::CFStringAppendCharacters,
         "CFStringAppend" => api::CFStringAppend,
         "CFStringInsert" => api::CFStringInsert,
