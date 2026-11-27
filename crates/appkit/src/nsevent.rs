@@ -410,27 +410,74 @@ unsafe extern "C" fn enter_exit_event(
     _tracking_number: isize,
     _user_data: *mut c_void,
 ) -> Id {
-    let window = crate::window::all()
+    make(Fields {
+        kind,
+        modifiers,
+        location,
+        window: window_numbered(window_number),
+        ..Fields::default()
+    })
+}
+
+/// The window whose `-windowNumber` is `number`, or nil for none.
+fn window_numbered(number: isize) -> Id {
+    crate::window::all()
         .into_iter()
         .find(|window| {
             let sel = objc::sel::get("windowNumber");
             // SAFETY: every entry is a live `NSWindow`, and this is
             // `NSInteger (id, SEL)`.
-            let number = unsafe {
+            let candidate = unsafe {
                 let f: unsafe extern "C" fn(Id, Sel) -> isize =
                     std::mem::transmute(objc::msg::entry());
                 f(*window, sel)
             };
-            number == window_number
+            candidate == number
         })
-        .unwrap_or(std::ptr::null_mut());
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// `+[NSEvent mouseEventWithType:location:modifierFlags:timestamp:
+/// windowNumber:context:eventNumber:clickCount:pressure:]`.
+///
+/// Programs build a mouse-down this way to hand to
+/// `-performWindowDragWithEvent:` when their own view starts a window drag.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn mouse_event(
+    _class: Id,
+    _sel: Sel,
+    kind: u64,
+    location: NSPoint,
+    modifiers: u64,
+    _timestamp: CGFloat,
+    window_number: isize,
+    _context: Id,
+    _event_number: isize,
+    click_count: isize,
+    // FIXME (ACCURACY): `-pressure` is derived from the event type rather than
+    // stored, so a caller's partial pressure reads back as 0 or 1.
+    _pressure: f32,
+) -> Id {
     make(Fields {
         kind,
         modifiers,
         location,
-        window,
+        window: window_numbered(window_number),
+        button: button_of_kind(kind),
+        clicks: click_count as i64,
         ..Fields::default()
     })
+}
+
+/// `-buttonNumber` for a mouse event built from its type alone.
+fn button_of_kind(event_kind: u64) -> i64 {
+    use sdl3::mouse;
+    let button = match event_kind {
+        kind::RIGHT_MOUSE_DOWN | kind::RIGHT_MOUSE_UP | kind::RIGHT_MOUSE_DRAGGED => mouse::RIGHT,
+        kind::OTHER_MOUSE_DOWN | kind::OTHER_MOUSE_UP | kind::OTHER_MOUSE_DRAGGED => mouse::MIDDLE,
+        _ => mouse::LEFT,
+    };
+    crate::button::number(button)
 }
 
 /// `+[NSEvent otherEventWithType:location:modifierFlags:timestamp:
@@ -582,6 +629,8 @@ pub(crate) fn install() {
             => enter_exit_event, c"@96@0:8Q16{CGPoint=dd}24Q40d48q56@64q72q80^v88";
         "otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:"
             => other_event, c"@96@0:8Q16{CGPoint=dd}24Q40d48q56@64s72q80q88";
+        "mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:"
+            => mouse_event, c"@92@0:8Q16{CGPoint=dd}24Q40d48q56@64q72q80f88";
     });
     methods!(class, {
         "type" => kind, c"Q16@0:8";
@@ -648,6 +697,56 @@ mod tests {
             assert_eq!(
                 super::location_in_window(event, objc::sel::get("locationInWindow")),
                 NSPoint { x: 3.0, y: 4.0 }
+            );
+        }
+    }
+
+    #[test]
+    fn a_built_mouse_event_reports_its_button_and_clicks() {
+        crate::bootstrap();
+        let built = |event_kind: u64| {
+            // SAFETY: the method's own prototype; no window has number 0.
+            unsafe {
+                mouse_event(
+                    std::ptr::null_mut(),
+                    objc::sel::get("mouseEventWithType:"),
+                    event_kind,
+                    NSPoint { x: 5.0, y: 6.0 },
+                    0,
+                    0.0,
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    2,
+                    1.0,
+                )
+            }
+        };
+        let left = built(kind::LEFT_MOUSE_DOWN);
+        // SAFETY: each prototype is the one its selector declares.
+        unsafe {
+            assert_eq!(
+                super::kind(left, objc::sel::get("type")),
+                kind::LEFT_MOUSE_DOWN
+            );
+            assert_eq!(
+                super::button_number(left, objc::sel::get("buttonNumber")),
+                0
+            );
+            assert_eq!(super::click_count(left, objc::sel::get("clickCount")), 2);
+            assert_eq!(
+                super::location_in_window(left, objc::sel::get("locationInWindow")),
+                NSPoint { x: 5.0, y: 6.0 }
+            );
+            let right = built(kind::RIGHT_MOUSE_UP);
+            assert_eq!(
+                super::button_number(right, objc::sel::get("buttonNumber")),
+                1
+            );
+            let other = built(kind::OTHER_MOUSE_DOWN);
+            assert_eq!(
+                super::button_number(other, objc::sel::get("buttonNumber")),
+                2
             );
         }
     }
